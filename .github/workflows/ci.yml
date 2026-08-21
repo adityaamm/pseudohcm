@@ -1,0 +1,175 @@
+# Continuous integration for the pseudohcm test harness.
+#
+# WHY THIS REPOSITORY NEEDED ONE
+#
+# It had no workflow and, until D66, no tests either. Its correctness was established
+# entirely by aiecona-hr's integration suite — which pip-installs this package **from
+# GitHub**. So a fault introduced here was invisible until published, and then failed
+# in a repository that had not changed.
+#
+# That is not theoretical. The de-growth injectors were wrong in three ways when first
+# written, and each would have surfaced as a confusing aiecona-hr failure:
+#
+#   `REMOVED` is not a value of `position.status` — the CHECK constraint would have
+#   refused it on ingestion, in the consumer's database job.
+#
+#   `valid_to is None` was used to mean "still open", finding 64 of 300 people and
+#   leaving the rest with assignments running past their own redundancy — a corpus the
+#   temporal integrity constraints would have rejected.
+#
+#   A closed org unit went on receiving joiners, so its headcount rose after its own
+#   closure.
+#
+# THE ONE THING THIS HARNESS MUST NEVER LOSE
+#
+# Gate 7. Every emitted record carries the synthetic marker, and production ingestion
+# refuses anything carrying it. If `mark()` ever stopped stamping a record type, this
+# harness would become capable of loading into a customer database — and the product's
+# own tests would still pass, because they test the refusal, not the stamping.
+#
+# So the marker coverage check below is not a nicety. It is the half of the poison pill
+# that lives in this repository.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Installed from its repository, exactly as aiecona-hr installs it. Not vendored and
+  # not checked out as a sibling — a sibling checkout is what lets a packaging fault
+  # pass here and fail everywhere else.
+  CONTRACT: "git+https://github.com/${{ github.repository_owner }}/aiecona-adapter-contract.git"
+
+jobs:
+  harness:
+    name: The harness generates, marks and installs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install the contract, then this package
+        run: |
+          pip install "$CONTRACT"
+          # --no-deps deliberately. `pyproject.toml` declares aiecona-adapter-contract
+          # as a dependency by name, and it is not on PyPI — resolving it would reach
+          # for a package that does not exist there. This mirrors the aiecona-hr CI,
+          # which installs the harness the same way and for the same reason.
+          pip install --no-deps .
+          pip install pytest
+
+      - name: Run the harness's own tests
+        run: python -m pytest -ra --tb=long tests
+
+      # From /tmp. Inside the checkout, `import pseudohcm` finds src/ whether or not
+      # the package was built correctly.
+      - name: It imports from outside its own repository
+        working-directory: /tmp
+        run: |
+          python -c "
+          import pseudohcm.generator, pseudohcm.scenarios, pseudohcm.emit, pseudohcm.marking
+          print('loaded from', pseudohcm.generator.__file__)
+          assert 'site-packages' in pseudohcm.generator.__file__, (
+              'imported src/ rather than the installed package')
+          "
+
+      # Document 10 §3 — the harness's central claim. Same seed, same parameters,
+      # byte-identical output. Everything downstream that pins a count depends on it,
+      # and an injector that selected at random would break it silently.
+      - name: Generation is reproducible
+        working-directory: /tmp
+        run: |
+          python -c "
+          import json
+          from datetime import date
+          from pseudohcm.generator import Parameters, generate
+          from pseudohcm.scenarios import inject_redundancy_programme, inject_unit_closure
+
+          def build():
+              c = generate(Parameters(employee_count=2000, units=12, seed=7))
+              inject_redundancy_programme(c, on=date(2024, 3, 31), count=300)
+              inject_unit_closure(c, on=date(2024, 9, 30))
+              return json.dumps(c.counts(), sort_keys=True) + '|' + json.dumps(
+                  [p['person_id'] for p in c.people][:50])
+
+          first, second = build(), build()
+          assert first == second, 'two runs of the same seed produced different corpora'
+          print('reproducible:', first[:80], '...')
+          "
+
+      # Gate 7, from this side. The product refuses marked records; this asserts the
+      # records are actually marked. A record type that slipped through unmarked would
+      # be silently loadable into a customer database, and no test in the product could
+      # detect it — the product's tests prove the refusal works, not that the stamp
+      # was applied.
+      - name: Every emitted record carries the synthetic marker
+        working-directory: /tmp
+        run: |
+          python -c "
+          from datetime import date
+          from contract.markers import SYNTHETIC_MARKER_FIELD, SYNTHETIC_MARKER_VALUE
+          from pseudohcm.generator import Parameters, generate
+          from pseudohcm.scenarios import inject_redundancy_programme, inject_unit_closure
+
+          c = generate(Parameters(employee_count=500, units=6, seed=5))
+          inject_redundancy_programme(c, on=date(2024, 3, 31), count=50)
+          inject_unit_closure(c, on=date(2024, 9, 30))
+
+          unmarked = []
+          for kind, rows in (('org_units', c.org_units), ('jobs', c.jobs),
+                             ('positions', c.positions), ('people', c.people),
+                             ('assignments', c.assignments)):
+              assert rows, kind + ' is empty — this check would pass by vacancy'
+              for row in rows:
+                  if row.get(SYNTHETIC_MARKER_FIELD) != SYNTHETIC_MARKER_VALUE:
+                      unmarked.append((kind, row.get('person_id') or row.get('position_id')))
+          assert not unmarked, f'{len(unmarked)} record(s) carry no marker: {unmarked[:5]}'
+          print('every record marked across', sum(map(len, (c.org_units, c.jobs,
+                c.positions, c.people, c.assignments))), 'rows')
+          "
+
+      # The de-growth scenarios are the reason this workflow exists. Asserted here as
+      # well as in tests/ because these are the properties aiecona-hr will rely on, and
+      # a change that quietly stopped producing involuntary exits would leave the
+      # product's D65 tests passing against data that no longer exercises them.
+      - name: The de-growth scenarios still produce de-growth
+        working-directory: /tmp
+        run: |
+          python -c "
+          from datetime import date
+          from pseudohcm.generator import Parameters, generate
+          from pseudohcm.scenarios import inject_redundancy_programme, inject_unit_closure
+
+          c = generate(Parameters(employee_count=2000, units=12, seed=7))
+          assert not any(p['exit_class'] == 'INVOLUNTARY' for p in c.people), (
+              'the base corpus produces involuntary exits — de-growth must be injected, '
+              'never generated, or every existing fixture changes shape')
+
+          r = inject_redundancy_programme(c, on=date(2024, 3, 31), count=300)
+          assert r['people_exited'] == r['positions_removed'] == 300
+          assert sum(1 for p in c.people if p['exit_class'] == 'INVOLUNTARY') == 300
+
+          u = inject_unit_closure(c, on=date(2024, 9, 30))
+          assert u['people_displaced'] > 0 and u['positions_removed'] > 0
+          print('redundancy:', r['people_exited'], 'exits,', r['positions_removed'],
+                'positions abolished |  closure:', u['people_displaced'], 'displaced,',
+                u['joiners_removed'], 'never-hired joiners removed')
+          "
+
+      # The harness must not be able to reach the product. Gate 1, from this side: if
+      # this repository ever imported aiecona, the separation the whole design rests on
+      # would be gone and gate 4 in the consumer would be proving nothing.
+      - name: This repository cannot import the product
+        working-directory: /tmp
+        run: |
+          python -c "
+          import importlib.util, sys
+          if importlib.util.find_spec('aiecona') is not None:
+              sys.exit('the product is importable from the harness environment — '
+                       'Gate 1 has been breached from this side')
+          print('the product is not reachable from here, as intended')
+          "
