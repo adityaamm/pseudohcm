@@ -147,7 +147,14 @@ def generate(params: Parameters | None = None) -> Corpus:
             "position_id": seat["position_id"], "assignment_type": "PRIMARY", "fte": 1.0,
             "manager_person_id": None,
             "valid_from": hired.isoformat(),
-            "valid_to": exited.isoformat() if exited else None,
+            # D67. `exit_date` is the LAST DAY WORKED; `valid_to` is the first day the
+            # record version is no longer true. They are one day apart, always.
+            #
+            # This wrote the exit date straight into valid_to, which ended every
+            # assignment a day early and made a same-day engagement inexpressible:
+            # `[30 Sept, 30 Sept)` contains no time and assignment_valid_period refuses
+            # it. Contract entities.ValidPeriod states the rule for both repositories.
+            "valid_to": ((exited + timedelta(days=1)).isoformat() if exited else None),
             # Transaction time: when the record was created, which for most is the same
             # day. The backdated-correction scenario deliberately breaks this.
             "tx_from": datetime.combine(hired, datetime.min.time(), tzinfo=timezone.utc).isoformat(),

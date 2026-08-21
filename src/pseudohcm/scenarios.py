@@ -114,6 +114,16 @@ def _employed_on(corpus: Corpus, when: date) -> list[dict]:
     ]
 
 
+def _day_after(day: date) -> str:
+    """The record window closes the day AFTER the last day worked — D67.
+
+    `exit_date` and `engagement_end` are real-world facts and inclusive; `valid_to` is
+    a record boundary and exclusive. Conflating them ends every engagement a day early
+    and makes a same-day one impossible to express.
+    """
+    return (day + timedelta(days=1)).isoformat()
+
+
 def _in_force(record: dict, when: date) -> bool:
     """Is this row in force on a date — **not** 'is its end date empty'.
 
@@ -171,6 +181,13 @@ def inject_redundancy_programme(corpus: Corpus, *, on: date, count: int) -> dict
     select that way; this is a fixture and a reproducible rule beats a realistic one
     that cannot be reasoned about.
     """
+    # Employed *before* the date, not on it. Nobody is made redundant on their first
+    # day, and more to the point a person hired on `on` would get an assignment window
+    # of `[on, on)` — zero length, which `assignment_valid_period` refuses because a
+    # closed-open interval with equal bounds contains no time.
+    #
+    # The unit-closure injector had this same fault and it reached CI. Fixed in both,
+    # because the two are the same mistake and finding it once should close it twice.
     candidates = sorted(_employed_on(corpus, on),
                         key=lambda p: (p["hire_date_current"], p["person_id"]))
     affected = candidates[:count]
@@ -183,12 +200,12 @@ def inject_redundancy_programme(corpus: Corpus, *, on: date, count: int) -> dict
     closed_positions: set[str] = set()
     for assignment in corpus.assignments:
         if assignment["person_id"] in person_ids and _in_force(assignment, on):
-            assignment["valid_to"] = on.isoformat()
+            assignment["valid_to"] = _day_after(on)
             closed_positions.add(assignment["position_id"])
 
     for position in corpus.positions:
         if position["position_id"] in closed_positions and _in_force(position, on):
-            position["valid_to"] = on.isoformat()
+            position["valid_to"] = _day_after(on)
             position["status"] = "ABOLISHED"
 
     return {
@@ -224,13 +241,13 @@ def inject_unit_closure(corpus: Corpus, *, on: date, unit_id: str | None = None)
         unit_id = corpus.org_units[-1]["org_unit_id"]
 
     unit = next(u for u in corpus.org_units if u["org_unit_id"] == unit_id)
-    unit["valid_to"] = on.isoformat()
+    unit["valid_to"] = _day_after(on)
 
     in_unit = {pos["position_id"] for pos in corpus.positions
                if pos["org_unit_id"] == unit_id}
     for position in corpus.positions:
         if position["position_id"] in in_unit and _in_force(position, on):
-            position["valid_to"] = on.isoformat()
+            position["valid_to"] = _day_after(on)
             position["status"] = "ABOLISHED"
 
     # People the base corpus hired into this unit AFTER the closure date. The generator
@@ -240,6 +257,13 @@ def inject_unit_closure(corpus: Corpus, *, on: date, unit_id: str | None = None)
     # They are removed rather than exited: an exit implies employment, and these people
     # were never hired. Leaving them would make the unit's headcount rise after its own
     # closure, which is not a shrinking organisation, it is a broken fixture.
+    # Strictly AFTER the closure. Somebody hired on the closure day worked one day and
+    # is a legitimate one-day engagement under D67 — `[30 Sept, 1 Oct)`.
+    #
+    # An earlier version used `>=` here to dodge a zero-length window. That was papering
+    # over the real fault, which was writing the exit date straight into `valid_to`:
+    # the fix belongs in the mapping, not in deleting the person. D67 makes the
+    # boundary hire expressible, so this reverts to the honest predicate.
     never_hired = {
         a["person_id"] for a in corpus.assignments
         if a["position_id"] in in_unit
@@ -254,7 +278,7 @@ def inject_unit_closure(corpus: Corpus, *, on: date, unit_id: str | None = None)
     displaced: set[str] = set()
     for assignment in corpus.assignments:
         if assignment["position_id"] in in_unit and _in_force(assignment, on):
-            assignment["valid_to"] = on.isoformat()
+            assignment["valid_to"] = _day_after(on)
             displaced.add(assignment["person_id"])
 
     for person in corpus.people:

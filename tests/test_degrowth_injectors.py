@@ -28,7 +28,7 @@ caught by asking whether the corpus can be true.
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -60,6 +60,131 @@ def in_force(record, when):
 @pytest.fixture
 def corpus():
     return generate(Parameters(employee_count=2000, units=12, seed=7))
+
+
+class TestEveryValidWindowIsAWindow:
+    """The constraint the product enforces, enforced here where the corpus is made.
+
+    `valid_to > valid_from` on every versioned table. A closed-open interval `[f, t)`
+    with `f == t` contains no time, so a zero-length row is not a short-lived record —
+    it is a contradiction, and PostgreSQL refuses it.
+
+    THIS IS THE TEST THAT SHOULD HAVE EXISTED FIRST
+
+    Both injectors produced one. `inject_unit_closure` treated somebody hired *on* the
+    closure date as an existing employee and closed their assignment the same day,
+    giving `[2024-09-30, 2024-09-30)`. One row, in a 4,000-person corpus.
+
+    It reached aiecona-hr's CI and failed the entire de-growth job — in a repository
+    that had not changed. That is the exact failure this harness's own workflow
+    docstring describes, and it happened one push after the workflow was written to
+    prevent it. Checking values against the enum was not enough; the *relationships*
+    between fields need checking too.
+    """
+
+    WINDOWED = ("org_units", "positions", "people", "assignments")
+
+    def zero_length(self, corpus) -> list[tuple[str, str]]:
+        found = []
+        for kind in self.WINDOWED:
+            for row in getattr(corpus, kind):
+                start, end = row.get("valid_from"), row.get("valid_to")
+                if end is not None and end <= start:
+                    found.append((kind, str(row.get("assignment_id")
+                                            or row.get("position_id")
+                                            or row.get("person_id")
+                                            or row.get("org_unit_id"))))
+        return found
+
+    def test_the_base_corpus_has_none(self, corpus):
+        assert self.zero_length(corpus) == []
+
+    def test_a_redundancy_creates_none(self, corpus):
+        inject_redundancy_programme(corpus, on=REDUNDANCY_DATE, count=300)
+        assert self.zero_length(corpus) == []
+
+    def test_a_closure_creates_none(self, corpus):
+        """The one that failed in aiecona-hr's CI.
+
+        The first fix treated a hire on the closure date as a hire that never happened.
+        That was papering over the real fault, which was writing the exit date straight
+        into `valid_to`. D67 fixed the mapping instead, so a boundary hire is now a
+        legitimate one-day engagement — `[30 Sept, 1 Oct)` — and this passes because the
+        window is a window, not because the person was deleted.
+        """
+        inject_unit_closure(corpus, on=CLOSURE_DATE)
+        assert self.zero_length(corpus) == []
+
+    def test_both_together_create_none(self, corpus):
+        inject_redundancy_programme(corpus, on=REDUNDANCY_DATE, count=300)
+        inject_unit_closure(corpus, on=CLOSURE_DATE)
+        assert self.zero_length(corpus) == []
+
+    @pytest.mark.parametrize("day", [1, 15, 28])
+    def test_no_closure_date_in_the_span_produces_one(self, corpus, day):
+        """Swept rather than spot-checked.
+
+        The original fault appeared on exactly one date out of a whole span, because it
+        needed a hire falling on the closure day. A single chosen date would have
+        missed it — and did.
+        """
+        from datetime import date as _date
+
+        inject_unit_closure(corpus, on=_date(2023, 6, day))
+        assert self.zero_length(corpus) == []
+
+    def test_the_record_window_closes_the_day_after_the_last_day_worked(self, corpus):
+        """D67, asserted as a relationship rather than a value.
+
+        `exit_date` is the last day worked — inclusive, what payroll pays and what
+        Workday and SuccessFactors mean. `valid_to` is the first day the record version
+        is no longer true — exclusive, so one version ends where the next begins.
+
+        They are one day apart, always. This harness wrote the exit date straight into
+        `valid_to`, which ended every assignment a day early and made a same-day
+        engagement inexpressible. `contract.entities.ValidPeriod` states the rule for
+        both repositories, and this asserts the harness obeys it.
+        """
+        by_person = {}
+        for a in corpus.assignments:
+            by_person.setdefault(a["person_id"], []).append(a)
+
+        checked = 0
+        for person in corpus.people:
+            if person["exit_date"] is None:
+                continue
+            for assignment in by_person.get(person["person_id"], []):
+                assert as_date(assignment["valid_to"]) == (
+                    as_date(person["exit_date"]) + timedelta(days=1)
+                ), (f"{person['person_id']} left on {person['exit_date']} and their "
+                    f"assignment window closes {assignment['valid_to']} — these must "
+                    "be exactly one day apart")
+                checked += 1
+        assert checked > 0, "no leavers in this corpus, so this asserts nothing"
+
+    def test_tenure_of_a_one_day_engagement_is_one_day(self, corpus):
+        """D68, on the harness's own arithmetic.
+
+        `end - start + 1`. Somebody who joins and leaves on the same day served one
+        day, and their record window spans exactly one day too. The two agree, which is
+        the whole point of separating them.
+        """
+        joined = left = date(2024, 9, 30)
+        assert (left - joined).days + 1 == 1
+        window_closes = left + timedelta(days=1)
+        assert (window_closes - joined).days == 1
+
+    def test_an_exit_never_precedes_a_hire(self, corpus):
+        """The same class on the person record. An exit before the hire is a person who
+        left before they arrived."""
+        inject_redundancy_programme(corpus, on=REDUNDANCY_DATE, count=300)
+        inject_unit_closure(corpus, on=CLOSURE_DATE)
+        backwards = [
+            p["person_id"] for p in corpus.people
+            if p["exit_date"] is not None
+            and as_date(p["exit_date"]) < as_date(p["hire_date_current"])
+        ]
+        assert backwards == []
 
 
 class TestTheCorpusOnlyUsesValuesTheSchemaAllows:
@@ -100,11 +225,16 @@ class TestTheRedundancyIsInternallyConsistent:
         """
         result = inject_redundancy_programme(corpus, on=REDUNDANCY_DATE, count=300)
         affected = set(result["person_ids"])
-        outliving = [
-            a for a in corpus.assignments
-            if a["person_id"] in affected and in_force(a, REDUNDANCY_DATE)
-        ]
-        assert outliving == []
+        day_after = REDUNDANCY_DATE + timedelta(days=1)
+
+        # In force ON the redundancy date — D67, that is their last day worked and they
+        # were employed for it. The record window closes the day after.
+        assert [a for a in corpus.assignments
+                if a["person_id"] in affected and in_force(a, REDUNDANCY_DATE)] != []
+        # And gone the day after. This is the assertion that catches the original
+        # `valid_to is None` fault, which left 236 of 300 running until 2025.
+        assert [a for a in corpus.assignments
+                if a["person_id"] in affected and in_force(a, day_after)] == []
 
     def test_a_position_is_abolished_for_every_person_made_redundant(self, corpus):
         """What separates a redundancy from a mass resignation. If the positions stayed
@@ -144,8 +274,15 @@ class TestTheUnitClosureIsInternallyConsistent:
         result = inject_unit_closure(corpus, on=CLOSURE_DATE)
         in_unit = {p["position_id"] for p in corpus.positions
                    if p["org_unit_id"] == result["org_unit_id"]}
+        # D67: the closure date is the last day worked, so people ARE still assigned on
+        # it. They are gone the day after. This asserted emptiness on the day itself,
+        # which was the pre-D67 reading and understated the unit by its whole staff on
+        # their final day.
         assert [a for a in corpus.assignments
-                if a["position_id"] in in_unit and in_force(a, CLOSURE_DATE)] == []
+                if a["position_id"] in in_unit and in_force(a, CLOSURE_DATE)] != []
+        assert [a for a in corpus.assignments
+                if a["position_id"] in in_unit
+                and in_force(a, CLOSURE_DATE + timedelta(days=1))] == []
 
     def test_nobody_joins_a_unit_after_it_closes(self, corpus):
         """24 people did, in the first version.
