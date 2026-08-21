@@ -26,7 +26,15 @@ class Parameters:
     positions_per_unit: int = 0            # 0 = derive from employee_count
     vacancy_rate: float = 0.03
     annual_attrition: float = 0.114
-    growth_curve_start: int = 32_100
+    # `growth_curve_start: int = 32_100` was declared here and referenced nowhere in
+    # this module. Removed rather than implemented: the class docstring above claims
+    # "every parameter documented and adjustable, nothing hidden", and a parameter that
+    # does nothing while looking like it shapes the headcount trajectory is worse than
+    # a missing one — somebody tunes it and concludes the generator ignores them.
+    #
+    # De-growth is not a curve parameter in any case. It is a decision an organisation
+    # takes on a date, and it lives in `scenarios.inject_redundancy_programme` and
+    # `scenarios.inject_unit_closure` (D66) where it can be asserted against.
     part_time_share: float = 0.11          # so the FTE basis differs from the people basis
     history_start: date = HISTORY_START
     history_end: date = date(2026, 8, 7)
