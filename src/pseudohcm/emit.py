@@ -13,6 +13,13 @@ from pseudohcm.generator import Corpus
 ENTITY_FILES = {
     "OrgUnit": "org_units", "Job": "jobs", "Position": "positions",
     "Person": "people", "Assignment": "assignments",
+    # P2.6. Written even when empty, which is deliberate: an absent file and an empty
+    # one say different things to whoever is loading them. Absent reads as "this
+    # harness does not know about ratings"; empty reads as "it does, and this run
+    # produced none" — which is the true statement when `rating_cycles` is 0.
+    "RatingScale": "rating_scales", "PerformanceCycle": "performance_cycles",
+    "PerformanceEvent": "performance_events",
+    "RoleInteraction": "role_interactions", "RoleRequirement": "role_requirements",
 }
 
 

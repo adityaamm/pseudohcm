@@ -39,6 +39,25 @@ class Parameters:
     history_start: date = HISTORY_START
     history_end: date = date(2026, 8, 7)
 
+    # -- P2.6: performance and role assessment ---------------------------------
+    #
+    # `rating_cycles = 0` produces none of it, so every existing test keeps the corpus
+    # it was written against. Opt-in rather than opt-out: turning this on changes row
+    # counts, and a generator that silently starts emitting five new entity types would
+    # break assertions that were right when they were written.
+    rating_cycles: int = 0                 # annual cycles ending before history_end
+    rating_points: int = 5
+    # The share of ratings deliberately left without a position. `performance_event`
+    # allows a null `position_id`, so the unattributable path is real and Pillar E
+    # counts those rows rather than dropping them. A corpus where every rating resolves
+    # to a unit never exercises it.
+    ratings_without_position: float = 0.02
+    role_interaction_density: float = 0.18  # share of ordered job pairs that get an edge
+    # Share of roles whose description will not support content assessment. Above 0.40
+    # `role_relevance.organisation_caveat` fires, so the default sits below the line
+    # and a test that wants the caveat raises it deliberately.
+    thin_description_share: float = 0.22
+
 
 @dataclass
 class Corpus:
@@ -47,12 +66,25 @@ class Corpus:
     positions: list[dict] = field(default_factory=list)
     people: list[dict] = field(default_factory=list)
     assignments: list[dict] = field(default_factory=list)
+    # P2.6. The entities P2.4 wired and nothing had ever produced. Until these existed,
+    # `rating_integrity` and `interaction_graph` had unit tests and no end-to-end run,
+    # and every CI failure this project has had came from that seam.
+    rating_scales: list[dict] = field(default_factory=list)
+    performance_cycles: list[dict] = field(default_factory=list)
+    performance_events: list[dict] = field(default_factory=list)
+    role_interactions: list[dict] = field(default_factory=list)
+    role_requirements: list[dict] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
         return {
             "OrgUnit": len(self.org_units), "Job": len(self.jobs),
             "Position": len(self.positions), "Person": len(self.people),
             "Assignment": len(self.assignments),
+            "RatingScale": len(self.rating_scales),
+            "PerformanceCycle": len(self.performance_cycles),
+            "PerformanceEvent": len(self.performance_events),
+            "RoleInteraction": len(self.role_interactions),
+            "RoleRequirement": len(self.role_requirements),
         }
 
 
@@ -64,7 +96,24 @@ def generate(params: Parameters | None = None) -> Corpus:
     p = params or Parameters()
     rng = random.Random(p.seed)
     corpus = Corpus()
-    now = datetime.now(timezone.utc).isoformat()
+
+    # `sync_at` IS DERIVED FROM THE PARAMETERS, NOT FROM THE CLOCK.
+    #
+    # This was `datetime.now(timezone.utc)`, which made the module docstring above and
+    # Document 10 §3 — "same seed and same parameters yields byte-identical output" —
+    # false for every run since the harness was written. Two corpora from identical
+    # parameters differed in every single row.
+    #
+    # It survived because the determinism test compared `person_id`s and assignment
+    # start dates rather than whole records. The test agreed with the code and the
+    # prose disagreed with both, which is Document 19's pattern exactly.
+    #
+    # The end of the described history is the honest value: a corpus covering the world
+    # up to `history_end` is a sync taken at `history_end`. Nothing asserts a specific
+    # `sync_at` — the integration tests check it is present, or take a max over it —
+    # so the data vintage this produces is stable rather than drifting with wall clock.
+    now = datetime.combine(p.history_end, datetime.min.time(),
+                           tzinfo=timezone.utc).isoformat()
 
     def prov(obj: str) -> dict:
         return {
@@ -162,4 +211,261 @@ def generate(params: Parameters | None = None) -> Corpus:
             "prov": prov("assignments"),
         }))
 
+    _generate_role_assessment(corpus, p, rng, prov)
+    _generate_performance(corpus, p, rng, prov)
     return corpus
+
+
+# ---------------------------------------------------------------------------
+# P2.6 — performance and role assessment
+# ---------------------------------------------------------------------------
+
+# The rating distributions a real organisation actually produces, by unit. A generator
+# that drew every rank uniformly would hand Pillar E a perfectly calibrated
+# organisation, and the integrity pillar would correctly report no compression, no
+# inflation and no divergence anywhere — from synthetic data that had none.
+#
+# That is the harness version of the well-formed 200: a corpus that cannot fail the
+# check it exists to exercise. D66 is the precedent — redundancy and unit closure were
+# added as injectors precisely because no fixture in the project had ever produced an
+# involuntary exit, which is how D65 survived 985 passing tests.
+#
+# Weights are over ranks 1..N, renormalised to the configured point count.
+_RATING_SHAPES: tuple[tuple[str, tuple[float, ...]], ...] = (
+    ("healthy", (0.05, 0.15, 0.45, 0.25, 0.10)),
+    # Everyone a 3. `spread` collapses and COMPRESSION fires.
+    ("compressed", (0.01, 0.04, 0.90, 0.04, 0.01)),
+    # Nobody below a 4. The classic inflated unit.
+    ("inflated", (0.00, 0.02, 0.13, 0.50, 0.35)),
+    ("harsh", (0.18, 0.37, 0.35, 0.08, 0.02)),
+)
+
+_DEPENDENCY_TYPES = ("PROVIDES_INPUT_TO", "APPROVES_FOR", "ESCALATES_TO",
+                     "COORDINATES_WITH")
+# Every basis appears. STRUCTURAL_INFERENCE carries a model version because the schema
+# refuses one without it — an inferred edge nobody can reproduce is not defensible
+# input to a score that ranks roles (Doc 03C §6.1).
+_BASES = ("STATED_IN_DESCRIPTION", "IDEOM_CONFIRMED", "STRUCTURAL_INFERENCE")
+_MODEL_VERSION = "pseudohcm-structural-inference-1.0"
+
+_DECISION_RIGHTS_BY_RANK: dict[int, tuple[str, ...]] = {
+    3: (),
+    4: ("TECHNICAL_AUTHORITY",),
+    5: ("TECHNICAL_AUTHORITY", "PRIORITISATION"),
+    6: ("TECHNICAL_AUTHORITY", "PRIORITISATION", "HIRING"),
+    7: ("TECHNICAL_AUTHORITY", "PRIORITISATION", "HIRING", "SPEND_APPROVAL",
+        "EXTERNAL_COMMITMENT"),
+}
+
+
+def _weights_for(shape: tuple[float, ...], points: int) -> list[float]:
+    """Fit a five-point shape onto whatever scale is configured.
+
+    Truncated and renormalised rather than interpolated. The shapes above are stated
+    over five points because that is what they describe; stretching them across three
+    would invent a distribution nobody wrote down.
+    """
+    trimmed = list(shape[:points]) + [0.0] * max(0, points - len(shape))
+    total = sum(trimmed)
+    return [w / total for w in trimmed] if total else [1 / points] * points
+
+
+def _generate_role_assessment(corpus: Corpus, p: Parameters, rng: random.Random,
+                              prov) -> None:
+    """One requirement per job, and a dependency graph over job codes.
+
+    NOT one per position. `role_requirement.position_id` exists for seat-specific
+    requirements and is null here, because a requirement per seat would give a
+    50,000-row table describing 25 distinct roles — and substitutability, which
+    compares required terms across job codes, would then compare a role with itself
+    24,000 times.
+    """
+    if not corpus.jobs:
+        return
+
+    total = len(corpus.jobs)
+    thin_count = round(p.thin_description_share * total)
+    thin_seen = 0
+    for index, job in enumerate(corpus.jobs):
+        # Deterministic rather than sampled, so the thin share is exactly the parameter
+        # at any corpus size. A sampled share drifts on small corpora, and the tests
+        # that matter here run small.
+        #
+        # Distributed by the Bresenham rule rather than `index % 100 < share * 100`,
+        # which is what this said first. With 25 job codes every index is below 22, so
+        # 22 of 25 roles came out thin against a parameter of 0.22 — a four-fold
+        # overshoot that would have fired `organisation_caveat` on every corpus and
+        # made the caveat look like the normal state of the world.
+        #
+        # It also spreads them: taking the first N would have made every thin role an
+        # Engineering one, since jobs are generated family by family.
+        thin = (index * thin_count) // total != ((index + 1) * thin_count) // total
+        if thin:
+            # Alternate on a counter of THIN-eligible roles, not on `index`.
+            #
+            # Keyed on `index`, the Bresenham selection above happened to pick only
+            # even indices, so every thin role came out ABSENT and THIN never appeared
+            # at all. The first attempt at a fix used `len(corpus.role_requirements)`,
+            # which is exactly `index` here because one requirement is appended per
+            # job — the same bug wearing a different expression, and the check caught
+            # it a second time.
+            #
+            # THIN is the more interesting of the two: text exists and does not support
+            # assessment, which is the case D24's suppression is really about.
+            quality = "THIN" if thin_seen % 2 else "ABSENT"
+            thin_seen += 1
+        else:
+            quality = "RICH" if index % 3 else "ADEQUATE"
+        # The schema refuses RICH or ADEQUATE with no text. A quality label the text
+        # does not support is the same lie as a figure without its caveat.
+        text = (None if quality == "ABSENT"
+                else f"Accountable for {job['job_family'].lower()} outcomes at "
+                     f"{job['job_level']}. Works with adjacent functions to deliver "
+                     "committed scope.")
+        corpus.role_requirements.append(mark({
+            "requirement_id": f"req-{job['job_code']}",
+            "job_id": job["job_id"], "position_id": None,
+            "stated_purpose": f"{job['job_family']} delivery at {job['job_level']}",
+            "description_text": text,
+            "description_quality": quality,
+            "required_level": job["job_level"],
+            "decision_rights": list(
+                _DECISION_RIGHTS_BY_RANK.get(job["job_level_rank"], ())),
+            "source": "HCM_JOB_DESCRIPTION",
+            "last_reviewed": (p.history_end - timedelta(days=rng.randrange(30, 900))
+                              ).isoformat(),
+            "valid_from": p.history_start.isoformat(), "valid_to": None,
+            "prov": prov("job_descriptions"),
+        }))
+
+    # --- the dependency graph ---
+    #
+    # Edges run between job ids and there is nowhere in the row to put a person. Two
+    # constraints the schema enforces and this must not trip: no self-dependency, and
+    # STRUCTURAL_INFERENCE must name its model version.
+    #
+    # Direction is biased up the level ranks, so seniors accumulate dependants and the
+    # graph has hubs. A uniformly random graph gives every role the same centrality and
+    # makes the ranking meaningless — the same failure as uniform ratings.
+    edge = 0
+    for source in corpus.jobs:
+        for target in corpus.jobs:
+            if source["job_id"] == target["job_id"]:
+                continue
+            lift = 1.6 if target["job_level_rank"] > source["job_level_rank"] else 0.7
+            if rng.random() >= p.role_interaction_density * lift:
+                continue
+            basis = _BASES[edge % len(_BASES)]
+            corpus.role_interactions.append(mark({
+                "interaction_id": f"int-{edge:06d}",
+                "from_job_id": source["job_id"], "from_position_id": None,
+                "to_job_id": target["job_id"], "to_position_id": None,
+                "dependency_type": _DEPENDENCY_TYPES[edge % len(_DEPENDENCY_TYPES)],
+                "strength": round(rng.uniform(0.35, 0.95), 3),
+                "basis": basis,
+                "confidence": round(rng.uniform(0.55, 0.99), 3),
+                "model_version": (_MODEL_VERSION
+                                  if basis == "STRUCTURAL_INFERENCE" else None),
+                "valid_from": p.history_start.isoformat(), "valid_to": None,
+                "prov": prov("job_descriptions"),
+            }))
+            edge += 1
+
+
+def _generate_performance(corpus: Corpus, p: Parameters, rng: random.Random,
+                          prov) -> None:
+    """Annual cycles, one rating per employed person per cycle.
+
+    WHO GETS RATED, AND WHY THE PREDICATE IS THE EMPLOYMENT ONE
+
+    A person is rated in a cycle if they were employed on the cycle end date — using
+    the same inclusive `exit_date` rule as D67, because a leaver whose last day is the
+    cycle end date did work the cycle. Rating everyone on record would put ratings
+    against people who left four years earlier, and Pillar E would report unit
+    populations that no headcount could reproduce.
+    """
+    if p.rating_cycles <= 0 or not corpus.people:
+        return
+
+    scale_id = "scale-primary"
+    corpus.rating_scales.append(mark({
+        "scale_id": scale_id, "label": f"{p.rating_points}-point performance scale",
+        "point_count": p.rating_points,
+        "points": [str(i) for i in range(1, p.rating_points + 1)],
+        "is_forced_distribution": False,
+        # Stated, so divergence is computable. Without it the pillar correctly reports
+        # "no intended distribution recorded" and the divergence half goes untested.
+        "target_distribution": [round(w, 4) for w in
+                                _weights_for(_RATING_SHAPES[0][1], p.rating_points)],
+        "valid_from": p.history_start.isoformat(), "valid_to": None,
+        "prov": prov("rating_scales"),
+    }))
+
+    position_of = {a["person_id"]: a["position_id"] for a in corpus.assignments}
+    unit_of = {s["position_id"]: s["org_unit_id"] for s in corpus.positions}
+    # A unit keeps its distribution shape across cycles. A unit that is compressed one
+    # year and inflated the next is noise, and CYCLE_DRIFT would fire on every unit
+    # every cycle — a finding that is always present is not a finding.
+    shape_of = {u["org_unit_id"]: _RATING_SHAPES[i % len(_RATING_SHAPES)][1]
+                for i, u in enumerate(corpus.org_units)}
+    ranks = list(range(1, p.rating_points + 1))
+
+    # The most recent year that finished before the corpus ends, then step back one
+    # year per cycle.
+    #
+    # This was computed inside the loop as `history_end.year - cycle_index`, adjusted
+    # down when it landed past the end. With a mid-year `history_end`, cycles 0 and 1
+    # both resolved to 31 December of the prior year — the same `period_end` AND the
+    # same `cycle_id`, which is the primary key of `performance_cycle`. Every person
+    # would have been rated twice in one cycle, and the load would have failed on a
+    # duplicate key rather than producing a wrong answer.
+    #
+    # Worth noting which way that failure ran: the constraint in the schema would have
+    # caught it. It is only visible here because the harness is checked at all.
+    latest_complete = (p.history_end.year - 1
+                       if date(p.history_end.year, 12, 31) >= p.history_end
+                       else p.history_end.year)
+
+    event = 0
+    for cycle_index in range(p.rating_cycles):
+        period_end = date(latest_complete - cycle_index, 12, 31)
+        if period_end < p.history_start:
+            break
+        period_start = date(period_end.year, 1, 1)
+        cycle_id = f"cycle-{period_end.year}"
+        corpus.performance_cycles.append(mark({
+            "cycle_id": cycle_id, "label": f"FY{period_end.year}",
+            "period_start": period_start.isoformat(),
+            "period_end": period_end.isoformat(),
+            "scale_id": scale_id, "status": "CLOSED",
+            "prov": prov("performance_cycles"),
+        }))
+
+        for person in corpus.people:
+            hired = date.fromisoformat(person["hire_date_current"])
+            exited = (date.fromisoformat(person["exit_date"])
+                      if person["exit_date"] else None)
+            if hired > period_end or (exited is not None and exited < period_end):
+                continue
+            position_id = position_of.get(person["person_id"])
+            unit = unit_of.get(position_id)
+            weights = shape_of.get(unit, _RATING_SHAPES[0][1])
+            rank = rng.choices(ranks, weights=_weights_for(weights, p.rating_points))[0]
+            corpus.performance_events.append(mark({
+                "event_id": f"perf-{event:07d}",
+                "person_id": person["person_id"],
+                # Null for a share of rows on purpose — see `ratings_without_position`.
+                "position_id": (None
+                                if rng.random() < p.ratings_without_position
+                                else position_id),
+                "cycle_id": cycle_id,
+                "rating_scale_id": scale_id,
+                "rating_rank": rank,
+                "has_narrative": rng.random() < 0.7,
+                "valid_from": period_end.isoformat(), "valid_to": None,
+                "tx_from": datetime.combine(period_end, datetime.min.time(),
+                                            tzinfo=timezone.utc).isoformat(),
+                "tx_to": None, "correction_of": None,
+                "prov": prov("performance_reviews"),
+            }))
+            event += 1
