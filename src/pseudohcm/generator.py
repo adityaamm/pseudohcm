@@ -53,6 +53,24 @@ class Parameters:
     # to a unit never exercises it.
     ratings_without_position: float = 0.02
     role_interaction_density: float = 0.18  # share of ordered job pairs that get an edge
+
+    # -- P2.7: the skills vocabulary --------------------------------------------
+    #
+    # Opt-in like the rating cycles, and for the same reason: turning it on changes
+    # row counts, and a generator that silently starts emitting four more entity types
+    # breaks assertions that were right when somebody wrote them.
+    #
+    # `skill_terms = 0` produces none of it, which is every existing corpus.
+    skill_terms: int = 0                   # customer vocabulary terms
+    skill_coverage: float = 0.62           # share of employed people holding assertions
+    # Share of terms with no mapping to a standard. D40 suppresses a cluster below the
+    # coverage threshold and D61 reports in the customer's own words, so a corpus where
+    # every term maps cleanly never exercises either. Real vocabularies are messier.
+    unmapped_term_share: float = 0.18
+    # Share of assertions that have expired by `history_end`. A certification that
+    # lapsed is not present supply, and a corpus without any never proves the
+    # difference is applied.
+    expired_assertion_share: float = 0.09
     # Share of roles whose description will not support content assessment. Above 0.40
     # `role_relevance.organisation_caveat` fires, so the default sits below the line
     # and a test that wants the caveat raises it deliberately.
@@ -69,6 +87,13 @@ class Corpus:
     # P2.6. The entities P2.4 wired and nothing had ever produced. Until these existed,
     # `rating_integrity` and `interaction_graph` had unit tests and no end-to-end run,
     # and every CI failure this project has had came from that seam.
+    # P2.7. The skills vocabulary — the last entities `role_relevance` needs before
+    # its substitutability component can be computed from anything real.
+    customer_skill_terms: list[dict] = field(default_factory=list)
+    canonical_skills: list[dict] = field(default_factory=list)
+    taxonomy_links: list[dict] = field(default_factory=list)
+    skill_assertions: list[dict] = field(default_factory=list)
+    role_required_terms: list[dict] = field(default_factory=list)
     rating_scales: list[dict] = field(default_factory=list)
     performance_cycles: list[dict] = field(default_factory=list)
     performance_events: list[dict] = field(default_factory=list)
@@ -80,6 +105,11 @@ class Corpus:
             "OrgUnit": len(self.org_units), "Job": len(self.jobs),
             "Position": len(self.positions), "Person": len(self.people),
             "Assignment": len(self.assignments),
+            "CustomerSkillTerm": len(self.customer_skill_terms),
+            "CanonicalSkill": len(self.canonical_skills),
+            "TaxonomyLink": len(self.taxonomy_links),
+            "SkillAssertion": len(self.skill_assertions),
+            "RoleRequiredTerm": len(self.role_required_terms),
             "RatingScale": len(self.rating_scales),
             "PerformanceCycle": len(self.performance_cycles),
             "PerformanceEvent": len(self.performance_events),
@@ -212,6 +242,7 @@ def generate(params: Parameters | None = None) -> Corpus:
         }))
 
     _generate_role_assessment(corpus, p, rng, prov)
+    _generate_skills(corpus, p, rng, prov)
     _generate_performance(corpus, p, rng, prov)
     return corpus
 
@@ -469,3 +500,217 @@ def _generate_performance(corpus: Corpus, p: Parameters, rng: random.Random,
                 "prov": prov("performance_reviews"),
             }))
             event += 1
+
+
+# ---------------------------------------------------------------------------
+# P2.7 — the skills vocabulary
+# ---------------------------------------------------------------------------
+
+# A customer's own words, by family. Deliberately ordinary business vocabulary and
+# deliberately NOT a taxonomy anybody publishes: these are the labels an organisation
+# happens to use, which is the whole premise of `CustomerSkillTerm` and D61.
+#
+# The first two of each family are shared with the family above it. That overlap is
+# not decoration — `role_relevance.substitutability` looks for job codes whose required
+# terms overlap by 70% or more, and a vocabulary partitioned cleanly by family would
+# find no substitutes anywhere and make the component useless.
+_FAMILY_TERMS: dict[str, tuple[str, ...]] = {
+    "Engineering": ("systems design", "code review", "incident response",
+                    "distributed systems", "release management"),
+    "Commercial": ("systems design", "code review", "pipeline management",
+                   "contract negotiation", "account planning"),
+    "Operations": ("incident response", "release management", "capacity planning",
+                   "vendor management", "process improvement"),
+    "Product": ("pipeline management", "account planning", "discovery research",
+                "roadmap planning", "experiment design"),
+    "Corporate Functions": ("vendor management", "process improvement",
+                            "financial control", "policy drafting",
+                            "regulatory reporting"),
+}
+
+# Terms every senior role needs regardless of family, which is what makes a senior in
+# one family a partial substitute for a senior in another.
+_SENIOR_TERMS: tuple[str, ...] = ("stakeholder management", "budget ownership")
+
+_EVIDENCE = ("SELF_DECLARED", "MANAGER_CONFIRMED", "CERTIFICATION", "ASSESSMENT",
+             "INFERRED_FROM_ROLE")
+
+
+def _generate_skills(corpus: Corpus, p: Parameters, rng: random.Random, prov) -> None:
+    """The customer's vocabulary, what it maps to, and who has claimed what.
+
+    WHAT THE STANDARD-SIDE ROWS ARE, AND WHAT THEY ARE NOT
+
+    `canonical_skill` exists to hold nodes from a published standard — O*NET or ESCO —
+    under that standard's licence. **Nothing here is drawn from either.** The rows this
+    generator produces carry synthetic concept identifiers and an attribution that says
+    so in the field a reader would check.
+
+    That is a guard-rail requirement and not a convenience. Embedding real standard
+    content in a synthetic harness would put third-party material into this repository
+    under an attribution the harness cannot honour, and a reviewer comparing a
+    `preferred_label` here against the real standard must find them obviously unrelated
+    rather than plausibly similar.
+
+    The *shape* is faithful — a concept id, a preferred label never rendered to a
+    customer, a crosswalk group, a version, an attribution string — which is what the
+    D61 translation path actually exercises. The content is ours.
+    """
+    if p.skill_terms <= 0 or not corpus.jobs:
+        return
+
+    by_job = {j["job_id"]: j for j in corpus.jobs}
+
+    # --- the customer's vocabulary ---
+    labels: list[str] = []
+    for family in FAMILIES:
+        labels.extend(_FAMILY_TERMS[family])
+    labels.extend(_SENIOR_TERMS)
+    # Deduplicated with order preserved: the family lists share terms on purpose, and
+    # a term is one term however many families use it.
+    seen: set[str] = set()
+    ordered = [x for x in labels if not (x in seen or seen.add(x))]
+    ordered = ordered[: p.skill_terms] if p.skill_terms < len(ordered) else ordered
+
+    unmapped_count = round(p.unmapped_term_share * len(ordered))
+    term_id_of: dict[str, str] = {}
+    for index, label in enumerate(ordered):
+        # Bresenham again, for an exact share spread across the list rather than
+        # clustered at one end — the same rule and the same reason as the thin
+        # descriptions above.
+        unmapped = (index * unmapped_count) // len(ordered) != (
+            (index + 1) * unmapped_count) // len(ordered)
+        term_id = f"term-{index:03d}"
+        term_id_of[label] = term_id
+        corpus.customer_skill_terms.append(mark({
+            "term_id": term_id, "label": label, "parent_term_id": None,
+            "source": "CUSTOMER_FRAMEWORK" if index % 3 else "HCM_DERIVED",
+            "mapping_status": "UNMAPPED" if unmapped else "MAPPED",
+            "valid_from": p.history_start.isoformat(), "valid_to": None,
+            "prov": prov("skill_terms"),
+        }))
+
+    # --- the standard-side nodes, synthetic throughout ---
+    #
+    # Two standards and a crosswalk group shared between them, because D61 keys a
+    # cluster on `crosswalk_group_id` and never on a label. A corpus with one standard
+    # never exercises the crosswalk at all.
+    mapped = [t for t in corpus.customer_skill_terms
+              if t["mapping_status"] == "MAPPED"]
+    for index, term in enumerate(mapped):
+        group = f"xwalk-{index // 2:03d}"
+        for standard in ("ONET", "ESCO"):
+            corpus.canonical_skills.append(mark({
+                "canonical_skill_id": f"canon-{standard.lower()}-{index:03d}",
+                "standard": standard,
+                # SYNTHETIC. Not a real concept identifier from either standard, and
+                # shaped so nobody could mistake it for one.
+                "standard_concept_id": f"SYNTHETIC-{standard}-{index:05d}",
+                "preferred_label": f"synthetic concept {index} ({standard.lower()})",
+                "crosswalk_group_id": group,
+                "standard_version": "synthetic-0",
+                "attribution": (
+                    "SYNTHETIC — generated by pseudohcm. Not derived from O*NET, ESCO "
+                    "or any published taxonomy, and carrying no third-party licence."
+                ),
+                "prov": prov("skill_taxonomy"),
+            }))
+
+    # --- our mapping claims ---
+    link = 0
+    for index, term in enumerate(mapped):
+        for standard in ("ONET", "ESCO"):
+            confirmed = index % 4 == 0
+            corpus.taxonomy_links.append(mark({
+                "link_id": f"link-{link:04d}",
+                "term_id": term["term_id"],
+                "canonical_skill_id": f"canon-{standard.lower()}-{index:03d}",
+                # D13. A spread of confidence, because a corpus where every mapping is
+                # certain never exercises the low-confidence caveat that travels with a
+                # substitutability comparison built on weak links.
+                "confidence": round(rng.uniform(0.55, 0.99), 3),
+                "method": "HUMAN_CONFIRMED" if confirmed else rng.choice(
+                    ("EXACT", "LEXICAL", "SEMANTIC")),
+                "approved_by": "aditya@builder.local" if confirmed else None,
+                "approved_at": (datetime.combine(p.history_end, datetime.min.time(),
+                                                 tzinfo=timezone.utc).isoformat()
+                                if confirmed else None),
+                "recorded_at": datetime.combine(
+                    p.history_start, datetime.min.time(),
+                    tzinfo=timezone.utc).isoformat(),
+                "superseded_at": None,
+                "prov": prov("skill_taxonomy"),
+            }))
+            link += 1
+
+    # --- what each role requires ---
+    #
+    # Family core terms plus the senior pair above L5. This is what gives
+    # substitutability something to find: two seniors in different families share the
+    # senior terms and one or two family terms, which lands some pairs above the 70%
+    # overlap threshold and leaves others below it.
+    requirement_of = {r["job_id"]: r["requirement_id"]
+                      for r in corpus.role_requirements}
+    for job in corpus.jobs:
+        requirement_id = requirement_of.get(job["job_id"])
+        if requirement_id is None:
+            continue
+        wanted = list(_FAMILY_TERMS[job["job_family"]])
+        if job["job_level_rank"] >= 5:
+            wanted += list(_SENIOR_TERMS)
+        for position, label in enumerate(wanted):
+            term_id = term_id_of.get(label)
+            if term_id is None:
+                continue
+            corpus.role_required_terms.append(mark({
+                "requirement_id": requirement_id, "term_id": term_id,
+                # The first three are essential; the rest are desirable. A requirement
+                # set where everything is essential makes every role look equally
+                # irreplaceable.
+                "is_essential": position < 3,
+                "prov": prov("job_descriptions"),
+            }))
+
+    # --- who has claimed what ---
+    employed = [person for person in corpus.people
+                if person["exit_date"] is None]
+    position_of = {a["person_id"]: a["position_id"] for a in corpus.assignments}
+    job_of = {s["position_id"]: s["job_id"] for s in corpus.positions}
+
+    assertion = 0
+    for person in employed:
+        # D40's coverage denominator is the employed population, so the share of them
+        # holding any assertion is the parameter that decides whether a cluster is
+        # reported or suppressed. Below it, the pillar must say insufficient coverage
+        # rather than no supply.
+        if rng.random() >= p.skill_coverage:
+            continue
+        job_id = job_of.get(position_of.get(person["person_id"]))
+        job = by_job.get(job_id)
+        if job is None:
+            continue
+        candidates = list(_FAMILY_TERMS[job["job_family"]])
+        if job["job_level_rank"] >= 5:
+            candidates += list(_SENIOR_TERMS)
+        for label in rng.sample(candidates, k=min(len(candidates),
+                                                  rng.randint(2, 4))):
+            term_id = term_id_of.get(label)
+            if term_id is None:
+                continue
+            asserted = p.history_start + timedelta(
+                days=rng.randrange((p.history_end - p.history_start).days))
+            expired = rng.random() < p.expired_assertion_share
+            corpus.skill_assertions.append(mark({
+                "assertion_id": f"assert-{assertion:06d}",
+                "person_id": person["person_id"], "term_id": term_id,
+                "proficiency": rng.randint(1, 5), "proficiency_scale_id": None,
+                "evidence_type": _EVIDENCE[assertion % len(_EVIDENCE)],
+                "asserted_at": asserted.isoformat(),
+                # An expired certification is not present supply. `expires_at` before
+                # `history_end` is what makes that testable.
+                "expires_at": ((p.history_end - timedelta(days=rng.randrange(1, 400)))
+                               .isoformat() if expired else None),
+                "valid_from": asserted.isoformat(), "valid_to": None,
+                "prov": prov("skill_assertions"),
+            }))
+            assertion += 1

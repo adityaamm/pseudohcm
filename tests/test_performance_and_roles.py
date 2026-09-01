@@ -228,3 +228,172 @@ class TestRoleRequirementsCarryWhatD77Needs:
         lowest = min(rank for rank, _ in pairs)
         highest = max(rank for rank, _ in pairs)
         assert dict(pairs)[highest] > dict(pairs)[lowest]
+
+
+SKILLED = Parameters(employee_count=400, units=8, seed=7, skill_terms=40)
+
+
+@pytest.fixture(scope="module")
+def skilled():
+    return generate(SKILLED)
+
+
+class TestTheSkillsVocabularyIsOffUnlessAskedFor:
+    def test_no_skills_by_default(self):
+        plain = generate(Parameters(employee_count=120, units=5, seed=3))
+        for entity in ("CustomerSkillTerm", "SkillAssertion", "TaxonomyLink",
+                       "CanonicalSkill", "RoleRequiredTerm"):
+            assert plain.counts()[entity] == 0, entity
+
+    def test_it_is_deterministic(self):
+        a = generate(Parameters(employee_count=150, units=5, seed=11, skill_terms=30))
+        b = generate(Parameters(employee_count=150, units=5, seed=11, skill_terms=30))
+        for entity in ("customer_skill_terms", "skill_assertions", "taxonomy_links",
+                       "canonical_skills", "role_required_terms"):
+            assert getattr(a, entity) == getattr(b, entity), entity
+
+
+class TestNothingHereIsRealStandardContent:
+    """A guard rail, asserted rather than trusted.
+
+    `canonical_skill` exists to hold O*NET or ESCO nodes under those standards'
+    licences. Embedding real content in a synthetic harness would put third-party
+    material in this repository under an attribution the harness cannot honour — and a
+    reviewer comparing a label here against the real standard must find them obviously
+    unrelated rather than plausibly similar.
+    """
+
+    def test_every_concept_id_is_marked_synthetic(self, skilled):
+        """Doubly marked, and the second mark was not planned.
+
+        `standard_concept_id` ends in `_id`, so Gate 7's poison pill prefixes it too —
+        the value reads `PSEUDO::SYNTHETIC-ONET-00000`. Asserted as a substring rather
+        than a prefix because of that, and it is a better outcome than the one intended:
+        a reviewer sees both that the row is synthetic and that it came from the
+        harness.
+        """
+        assert skilled.canonical_skills
+        for node in skilled.canonical_skills:
+            assert "SYNTHETIC-" in node["standard_concept_id"]
+            assert "PSEUDO::" in node["standard_concept_id"]
+
+    def test_every_node_says_so_in_its_attribution(self, skilled):
+        for node in skilled.canonical_skills:
+            assert "SYNTHETIC" in node["attribution"]
+            assert "no third-party licence" in node["attribution"]
+
+    def test_no_label_claims_to_be_a_real_standard_version(self, skilled):
+        for node in skilled.canonical_skills:
+            assert node["standard_version"] == "synthetic-0"
+
+
+class TestTheVocabularyCanProduceAFinding:
+    def test_terms_are_shared_across_families(self, skilled):
+        """The property substitutability depends on. A vocabulary partitioned cleanly
+        by family finds no substitutes anywhere and makes the component useless."""
+        by_job = {j["job_id"]: j for j in skilled.jobs}
+        req_job = {r["requirement_id"]: r["job_id"]
+                   for r in skilled.role_requirements}
+        by_family: dict[str, set] = {}
+        for rt in skilled.role_required_terms:
+            family = by_job[req_job[rt["requirement_id"]]]["job_family"]
+            by_family.setdefault(family, set()).add(rt["term_id"])
+        families = list(by_family.values())
+        shared = [a & b for i, a in enumerate(families) for b in families[i + 1:]]
+        assert any(shared), "no two families share a required term"
+
+    def test_the_overlap_discriminates_rather_than_matching_everything(self, skilled):
+        """Both failure directions matter. If no pair clears the 70% threshold the
+        component always says 'irreplaceable'; if every pair clears it, always
+        'replaceable'. Either is a component that cannot distinguish."""
+        import itertools
+
+        req_job = {r["requirement_id"]: r["job_id"]
+                   for r in skilled.role_requirements}
+        terms: dict[str, set] = {}
+        for rt in skilled.role_required_terms:
+            terms.setdefault(req_job[rt["requirement_id"]], set()).add(rt["term_id"])
+        overlaps = [len(terms[a] & terms[b]) / len(terms[a])
+                    for a, b in itertools.permutations(sorted(terms), 2) if terms[a]]
+        above = sum(1 for o in overlaps if o >= 0.70)
+        assert 0 < above < len(overlaps), (
+            f"{above} of {len(overlaps)} ordered job pairs clear the threshold")
+
+    def test_some_assertions_have_expired(self, skilled):
+        """An expired certification is not present supply, and a corpus without any
+        never proves the difference is applied."""
+        expired = [a for a in skilled.skill_assertions if a["expires_at"]]
+        assert 0 < len(expired) < len(skilled.skill_assertions)
+
+    def test_some_terms_reach_no_standard(self, skilled):
+        """D61 reports in the customer's own words and D40 suppresses a cluster below
+        the coverage threshold. A vocabulary where every term maps cleanly exercises
+        neither."""
+        unmapped = [t for t in skilled.customer_skill_terms
+                    if t["mapping_status"] == "UNMAPPED"]
+        assert 0 < len(unmapped) < len(skilled.customer_skill_terms)
+        linked = {link["term_id"] for link in skilled.taxonomy_links}
+        assert all(t["term_id"] not in linked for t in unmapped)
+
+    def test_coverage_is_partial_so_the_denominator_means_something(self, skilled):
+        """Everyone holding an assertion makes D40's coverage suppression unreachable."""
+        employed = [p for p in skilled.people if p["exit_date"] is None]
+        holders = {a["person_id"] for a in skilled.skill_assertions}
+        share = len(holders) / len(employed)
+        assert 0.3 < share < 0.9, share
+
+    def test_only_employed_people_hold_assertions(self, skilled):
+        """G15's lesson. Assertions against leavers inflate the coverage numerator
+        against a denominator that excludes them."""
+        leavers = {p["person_id"] for p in skilled.people if p["exit_date"]}
+        assert not {a["person_id"] for a in skilled.skill_assertions} & leavers
+
+    def test_every_evidence_type_appears(self, skilled):
+        """The evidence weighting orders these, and that ordering is a claim. A corpus
+        using one type never tests it."""
+        assert len({a["evidence_type"] for a in skilled.skill_assertions}) >= 4
+
+    def test_the_crosswalk_group_is_shared_between_standards(self, skilled):
+        """D61 keys a cluster on `crosswalk_group_id` and never on a label. A corpus
+        where each standard has its own groups never exercises the crosswalk."""
+        groups: dict[str, set] = {}
+        for node in skilled.canonical_skills:
+            groups.setdefault(node["crosswalk_group_id"], set()).add(node["standard"])
+        assert any(len(s) > 1 for s in groups.values())
+
+    def test_mapping_confidence_varies(self, skilled):
+        """D13. A comparison built on weak links inherits their confidence, and a
+        corpus where every mapping is certain never carries that caveat."""
+        assert len({link["confidence"] for link in skilled.taxonomy_links}) > 3
+
+    def test_some_mappings_are_human_confirmed_and_some_are_not(self, skilled):
+        approved = [link for link in skilled.taxonomy_links if link["approved_by"]]
+        assert 0 < len(approved) < len(skilled.taxonomy_links)
+
+
+class TestRoleRequirementsCarryTheirTerms:
+    def test_every_role_requires_something(self, skilled):
+        required = {rt["requirement_id"] for rt in skilled.role_required_terms}
+        assert len(required) == len(skilled.role_requirements)
+
+    def test_essential_and_desirable_both_appear(self, skilled):
+        """A requirement set where everything is essential makes every role look
+        equally irreplaceable."""
+        flags = {rt["is_essential"] for rt in skilled.role_required_terms}
+        assert flags == {True, False}
+
+    def test_senior_roles_require_more_than_junior_ones(self, skilled):
+        by_job = {j["job_id"]: j for j in skilled.jobs}
+        req_job = {r["requirement_id"]: r["job_id"]
+                   for r in skilled.role_requirements}
+        counts: dict[int, int] = {}
+        for rt in skilled.role_required_terms:
+            rank = by_job[req_job[rt["requirement_id"]]]["job_level_rank"]
+            counts[rank] = counts.get(rank, 0) + 1
+        assert counts[max(counts)] > counts[min(counts)]
+
+    def test_every_required_term_is_a_real_term(self, skilled):
+        """A dangling reference here would make substitutability compare against terms
+        nobody declared."""
+        known = {t["term_id"] for t in skilled.customer_skill_terms}
+        assert all(rt["term_id"] in known for rt in skilled.role_required_terms)

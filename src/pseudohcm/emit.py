@@ -17,6 +17,15 @@ ENTITY_FILES = {
     # one say different things to whoever is loading them. Absent reads as "this
     # harness does not know about ratings"; empty reads as "it does, and this run
     # produced none" — which is the true statement when `rating_cycles` is 0.
+    # P2.7. The skills vocabulary. `CanonicalSkill` rows are SYNTHETIC throughout —
+    # synthetic concept ids and an attribution saying so — because embedding real
+    # O*NET or ESCO content in this harness would put third-party material here under
+    # a licence the harness cannot honour.
+    "CustomerSkillTerm": "customer_skill_terms",
+    "CanonicalSkill": "canonical_skills",
+    "TaxonomyLink": "taxonomy_links",
+    "SkillAssertion": "skill_assertions",
+    "RoleRequiredTerm": "role_required_terms",
     "RatingScale": "rating_scales", "PerformanceCycle": "performance_cycles",
     "PerformanceEvent": "performance_events",
     "RoleInteraction": "role_interactions", "RoleRequirement": "role_requirements",
