@@ -54,7 +54,7 @@ class Parameters:
     ratings_without_position: float = 0.02
     role_interaction_density: float = 0.18  # share of ordered job pairs that get an edge
 
-    # -- P2.7: the skills vocabulary --------------------------------------------
+    # -- P2.7, D90: the skills vocabulary ---------------------------------------
     #
     # Opt-in like the rating cycles, and for the same reason: turning it on changes
     # row counts, and a generator that silently starts emitting four more entity types
