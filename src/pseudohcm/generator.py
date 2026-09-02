@@ -491,6 +491,22 @@ def _generate_performance(corpus: Corpus, p: Parameters, rng: random.Random,
                                 else position_id),
                 "cycle_id": cycle_id,
                 "rating_scale_id": scale_id,
+                # D100. THE CUSTOMER'S OWN LABEL, AND IT WAS NOT BEING EMITTED.
+                #
+                # `performance_event.rating_value` is NOT NULL — it is what the
+                # customer's system actually said, carried unnormalised so a reading
+                # can be shown back in their own words. `rating_rank` beside it is our
+                # ordinal, for comparison across cycles and scales.
+                #
+                # This harness emitted the rank and not the label, so every rating was
+                # refused at insertion. **No performance event has ever loaded through
+                # the adapter in any environment** — found by running the chain end to
+                # end rather than by any test, because nothing had ever run a corpus
+                # with `rating_cycles > 0` through ingestion.
+                #
+                # Taken from the scale's own `points` so the label and the rank cannot
+                # disagree; inventing a separate vocabulary here is how they would.
+                "rating_value": str(rank),
                 "rating_rank": rank,
                 "has_narrative": rng.random() < 0.7,
                 "valid_from": period_end.isoformat(), "valid_to": None,
