@@ -25,6 +25,9 @@ ENTITY_FILES = {
     "CanonicalSkill": "canonical_skills",
     "TaxonomyLink": "taxonomy_links",
     "SkillAssertion": "skill_assertions",
+    # D129. Emitted because an assertion cites it, and a proficiency with no
+    # scale is uninterpretable — the database says so and refuses the row.
+    "ProficiencyScale": "proficiency_scales",
     "RoleRequiredTerm": "role_required_terms",
     "RatingScale": "rating_scales", "PerformanceCycle": "performance_cycles",
     "PerformanceEvent": "performance_events",

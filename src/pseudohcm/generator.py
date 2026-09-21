@@ -93,6 +93,16 @@ class Corpus:
     canonical_skills: list[dict] = field(default_factory=list)
     taxonomy_links: list[dict] = field(default_factory=list)
     skill_assertions: list[dict] = field(default_factory=list)
+    # D129. THE SCALE AN ASSERTED PROFICIENCY IS MEASURED ON.
+    #
+    # This did not exist, and every assertion carried `proficiency_scale_id: None`
+    # beside a proficiency of 1 to 5. `skill_assertion_proficiency_needs_a_scale`
+    # refuses that — *a proficiency value without the scale it was measured on is
+    # uninterpretable, and comparing it with anything else would be guesswork* — so a
+    # corpus with skills could never be ingested at all. Nothing found it because
+    # `skill_terms` defaults to ZERO, so every corpus this project has ever loaded
+    # through the adapter contained none.
+    proficiency_scales: list[dict] = field(default_factory=list)
     role_required_terms: list[dict] = field(default_factory=list)
     rating_scales: list[dict] = field(default_factory=list)
     performance_cycles: list[dict] = field(default_factory=list)
@@ -109,6 +119,7 @@ class Corpus:
             "CanonicalSkill": len(self.canonical_skills),
             "TaxonomyLink": len(self.taxonomy_links),
             "SkillAssertion": len(self.skill_assertions),
+            "ProficiencyScale": len(self.proficiency_scales),
             "RoleRequiredTerm": len(self.role_required_terms),
             "RatingScale": len(self.rating_scales),
             "PerformanceCycle": len(self.performance_cycles),
@@ -548,6 +559,7 @@ _FAMILY_TERMS: dict[str, tuple[str, ...]] = {
 # one family a partial substitute for a senior in another.
 _SENIOR_TERMS: tuple[str, ...] = ("stakeholder management", "budget ownership")
 
+_PROFICIENCY_SCALE_ID = "proficiency-scale-primary"
 _EVIDENCE = ("SELF_DECLARED", "MANAGER_CONFIRMED", "CERTIFICATION", "ASSESSMENT",
              "INFERRED_FROM_ROLE")
 
@@ -613,6 +625,19 @@ def _generate_skills(corpus: Corpus, p: Parameters, rng: random.Random, prov) ->
     # never exercises the crosswalk at all.
     mapped = [t for t in corpus.customer_skill_terms
               if t["mapping_status"] == "MAPPED"]
+    # D129. One scale, emitted before the assertions that cite it. A harness that
+    # produced assertions and no scale produced data the product is right to refuse.
+    corpus.proficiency_scales.append(mark({
+        "scale_id": _PROFICIENCY_SCALE_ID,
+        "label": "5-point proficiency scale",
+        "min_value": 1, "max_value": 5,
+        # Null on purpose: until IDeOM confirms how this scale relates to others, values
+        # on it are comparable only within it. The column exists to say so.
+        "normalised_by": None,
+        "valid_from": p.history_start.isoformat(), "valid_to": None,
+        "prov": prov("proficiency_scales"),
+    }))
+
     for index, term in enumerate(mapped):
         group = f"xwalk-{index // 2:03d}"
         for standard in ("ONET", "ESCO"):
@@ -727,7 +752,8 @@ def _generate_skills(corpus: Corpus, p: Parameters, rng: random.Random, prov) ->
             corpus.skill_assertions.append(mark({
                 "assertion_id": f"assert-{assertion:06d}",
                 "person_id": person["person_id"], "term_id": term_id,
-                "proficiency": rng.randint(1, 5), "proficiency_scale_id": None,
+                "proficiency": rng.randint(1, 5),
+                "proficiency_scale_id": _PROFICIENCY_SCALE_ID,
                 "evidence_type": _EVIDENCE[assertion % len(_EVIDENCE)],
                 "asserted_at": asserted.isoformat(),
                 # An expired certification is not present supply. `expires_at` before
