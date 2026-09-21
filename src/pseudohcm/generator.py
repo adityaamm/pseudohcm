@@ -365,6 +365,9 @@ def _generate_role_assessment(corpus: Corpus, p: Parameters, rng: random.Random,
                      f"{job['job_level']}. Works with adjacent functions to deliver "
                      "committed scope.")
         corpus.role_requirements.append(mark({
+                # D125. The second clock: a role requirement is corrected as often as it
+                # is rewritten, and only this column can tell the two apart.
+                "tx_from": _REQUIREMENT_KNOWN_AT, "tx_to": None,
             "requirement_id": f"req-{job['job_code']}",
             "job_id": job["job_id"], "position_id": None,
             "stated_purpose": f"{job['job_family']} delivery at {job['job_level']}",
@@ -560,6 +563,10 @@ _FAMILY_TERMS: dict[str, tuple[str, ...]] = {
 _SENIOR_TERMS: tuple[str, ...] = ("stakeholder management", "budget ownership")
 
 _PROFICIENCY_SCALE_ID = "proficiency-scale-primary"
+# D125. When we came to hold a role requirement as our claim. Derived from the
+# parameters rather than the clock, like every other timestamp here, so the corpus stays
+# byte-identical for a seed.
+_REQUIREMENT_KNOWN_AT = "2015-01-01T00:00:00+00:00"
 _EVIDENCE = ("SELF_DECLARED", "MANAGER_CONFIRMED", "CERTIFICATION", "ASSESSMENT",
              "INFERRED_FROM_ROLE")
 
@@ -695,13 +702,13 @@ def _generate_skills(corpus: Corpus, p: Parameters, rng: random.Random, prov) ->
     # more than one. Emitting the identifier alone would leave the canonical column
     # `requirement_valid_from` unfilled and the load refused, which is the right
     # outcome: a link whose parent version cannot be named is a link to nothing.
-    requirement_of = {r["job_id"]: (r["requirement_id"], r["valid_from"])
+    requirement_of = {r["job_id"]: (r["requirement_id"], r["valid_from"], r["tx_from"])
                       for r in corpus.role_requirements}
     for job in corpus.jobs:
         version = requirement_of.get(job["job_id"])
         if version is None:
             continue
-        requirement_id, requirement_valid_from = version
+        requirement_id, requirement_valid_from, requirement_tx_from = version
         wanted = list(_FAMILY_TERMS[job["job_family"]])
         if job["job_level_rank"] >= 5:
             wanted += list(_SENIOR_TERMS)
@@ -712,6 +719,8 @@ def _generate_skills(corpus: Corpus, p: Parameters, rng: random.Random, prov) ->
             corpus.role_required_terms.append(mark({
                 "requirement_id": requirement_id,
                 "requirement_valid_from": requirement_valid_from,
+                # D125. Both of the parent's clocks — see migration 019.
+                "requirement_tx_from": requirement_tx_from,
                 "term_id": term_id,
                 # The first three are essential; the rest are desirable. A requirement
                 # set where everything is essential makes every role look equally
