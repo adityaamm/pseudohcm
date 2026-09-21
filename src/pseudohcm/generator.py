@@ -665,12 +665,18 @@ def _generate_skills(corpus: Corpus, p: Parameters, rng: random.Random, prov) ->
     # substitutability something to find: two seniors in different families share the
     # senior terms and one or two family terms, which lands some pairs above the 70%
     # overlap threshold and leaves others below it.
-    requirement_of = {r["job_id"]: r["requirement_id"]
+    # The requirement VERSION, not just its identifier — D126. A required skill belongs
+    # to a version of a role description, and since migration 016 a description can have
+    # more than one. Emitting the identifier alone would leave the canonical column
+    # `requirement_valid_from` unfilled and the load refused, which is the right
+    # outcome: a link whose parent version cannot be named is a link to nothing.
+    requirement_of = {r["job_id"]: (r["requirement_id"], r["valid_from"])
                       for r in corpus.role_requirements}
     for job in corpus.jobs:
-        requirement_id = requirement_of.get(job["job_id"])
-        if requirement_id is None:
+        version = requirement_of.get(job["job_id"])
+        if version is None:
             continue
+        requirement_id, requirement_valid_from = version
         wanted = list(_FAMILY_TERMS[job["job_family"]])
         if job["job_level_rank"] >= 5:
             wanted += list(_SENIOR_TERMS)
@@ -679,7 +685,9 @@ def _generate_skills(corpus: Corpus, p: Parameters, rng: random.Random, prov) ->
             if term_id is None:
                 continue
             corpus.role_required_terms.append(mark({
-                "requirement_id": requirement_id, "term_id": term_id,
+                "requirement_id": requirement_id,
+                "requirement_valid_from": requirement_valid_from,
+                "term_id": term_id,
                 # The first three are essential; the rest are desirable. A requirement
                 # set where everything is essential makes every role look equally
                 # irreplaceable.
