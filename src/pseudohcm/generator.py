@@ -202,8 +202,11 @@ def generate(params: Parameters | None = None) -> Corpus:
             "title": f"{job['job_family']} {job['job_level']}",
             "job_id": job["job_id"], "org_unit_id": unit["org_unit_id"],
             "reports_to_position_id": None if i == 0 else f"pos-{rng.randrange(max(1, i // 8)):06d}",
-            "is_critical": rng.random() < 0.008,
-            "criticality_basis": [], "criticality_score": None,
+            # D159. What the emulated HR system says, under the contract's field name
+            # (`contract.fields.HR_CRITICAL_FLAG`). The same draw as before, so every
+            # seeded corpus is otherwise unchanged; no criticality score or basis,
+            # because no HR system this emulates supplies one.
+            "hr_critical_flag": rng.random() < 0.008,
             "status": "FILLED" if filled else "VACANT", "fte": 1.0,
             "valid_from": p.history_start.isoformat(), "valid_to": None,
             "prov": prov("positions"),
