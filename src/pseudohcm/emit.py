@@ -32,6 +32,8 @@ ENTITY_FILES = {
     "RatingScale": "rating_scales", "PerformanceCycle": "performance_cycles",
     "PerformanceEvent": "performance_events",
     "RoleInteraction": "role_interactions", "RoleRequirement": "role_requirements",
+    # D174. Empty unless the corpus was generated with `succession` on.
+    "SuccessionNomination": "succession_nominations",
 }
 
 

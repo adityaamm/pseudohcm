@@ -76,6 +76,25 @@ class Parameters:
     # and a test that wants the caveat raises it deliberately.
     thin_description_share: float = 0.22
 
+    # -- D174: the succession pipeline -----------------------------------------
+    #
+    # Opt-in like the rating cycles and the skills vocabulary, for the same reason:
+    # turning it on adds an entity and a field, and a corpus that silently changed
+    # would break assertions that were right when written. Off, every corpus is
+    # byte-identical to before.
+    #
+    # On, the emulated HR system nominates successors for the positions it flags
+    # critical, in the realistic mix the owner chose: about a third with none, a third
+    # with one, a third with two or three; some people on several pipelines; and a few
+    # nominations the product must refuse — for positions it does not flag, and for
+    # people who have left — so "not stored, only counted" is exercised end to end.
+    # The readiness labels are plain business language, no vendor's (the owner's
+    # choice). Org units also carry a legal-entity code (contract 0.4.0).
+    succession: bool = False
+    successor_reuse_share: float = 0.15     # nominations reusing someone already named
+    nominations_outside_critical: int = 3   # refused: position not flagged critical
+    nominations_of_leavers: int = 2         # refused: person no longer employed
+
 
 @dataclass
 class Corpus:
@@ -109,6 +128,8 @@ class Corpus:
     performance_events: list[dict] = field(default_factory=list)
     role_interactions: list[dict] = field(default_factory=list)
     role_requirements: list[dict] = field(default_factory=list)
+    # D174. Empty unless `Parameters.succession` is on.
+    succession_nominations: list[dict] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
         return {
@@ -126,6 +147,7 @@ class Corpus:
             "PerformanceEvent": len(self.performance_events),
             "RoleInteraction": len(self.role_interactions),
             "RoleRequirement": len(self.role_requirements),
+            "SuccessionNomination": len(self.succession_nominations),
         }
 
 
@@ -258,7 +280,68 @@ def generate(params: Parameters | None = None) -> Corpus:
     _generate_role_assessment(corpus, p, rng, prov)
     _generate_skills(corpus, p, rng, prov)
     _generate_performance(corpus, p, rng, prov)
+    if p.succession:
+        # Its own generator, seeded from the parameters, so turning it on cannot shift
+        # a single draw anything above made.
+        _generate_succession(corpus, p, random.Random(p.seed + 174), prov)
     return corpus
+
+
+# ---------------------------------------------------------------------------
+# D174 — the succession pipeline
+# ---------------------------------------------------------------------------
+
+READINESS_BANDS = (("Ready now", 0.35), ("Ready in 1-2 years", 0.40),
+                   ("Ready in 3+ years", 0.25))
+LEGAL_ENTITIES = ("LE-GB", "LE-US", "LE-IN", "LE-NL", "LE-DE")
+
+
+def _band(rng: random.Random) -> str:
+    draw, total = rng.random(), 0.0
+    for label, share in READINESS_BANDS:
+        total += share
+        if draw < total:
+            return label
+    return READINESS_BANDS[-1][0]
+
+
+def _generate_succession(corpus: Corpus, p: Parameters, rng: random.Random,
+                         prov) -> None:
+    for n, unit in enumerate(corpus.org_units):
+        unit["legal_entity_code"] = LEGAL_ENTITIES[n % len(LEGAL_ENTITIES)]
+    employed = [x for x in corpus.people if x["exit_date"] is None]
+    leavers = [x for x in corpus.people if x["exit_date"] is not None]
+    flagged = [s for s in corpus.positions if s["hr_critical_flag"]]
+    others = [s for s in corpus.positions if not s["hr_critical_flag"]]
+    named: list[dict] = []
+    rows: list[tuple[dict, dict]] = []
+    for seat in flagged:
+        draw = rng.random()
+        how_many = 0 if draw < 1 / 3 else 1 if draw < 2 / 3 else rng.choice((2, 3))
+        chosen: list[dict] = []
+        for _ in range(how_many):
+            if named and rng.random() < p.successor_reuse_share:
+                who = rng.choice(named)
+            else:
+                who = rng.choice(employed)
+            if who not in chosen:
+                chosen.append(who)
+        named.extend(chosen)
+        rows += [(seat, who) for who in chosen]
+    rows += [(rng.choice(others), rng.choice(employed))
+             for _ in range(min(p.nominations_outside_critical, len(others)))]
+    rows += [(rng.choice(flagged), rng.choice(leavers))
+             for _ in range(min(p.nominations_of_leavers, len(leavers)))
+             if flagged]
+    for n, (seat, who) in enumerate(rows):
+        since = p.history_end - timedelta(days=rng.randrange(30, 365))
+        corpus.succession_nominations.append(mark({
+            "nomination_id": f"nom-{n:06d}",
+            "position_id": seat["position_id"], "person_id": who["person_id"],
+            "readiness_band": _band(rng),
+            "valid_from": since.isoformat(), "valid_to": None,
+            "prov": prov("succession"),
+        }))
 
 
 # ---------------------------------------------------------------------------
