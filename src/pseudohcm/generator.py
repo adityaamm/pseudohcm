@@ -94,6 +94,16 @@ class Parameters:
     successor_reuse_share: float = 0.15     # nominations reusing someone already named
     nominations_outside_critical: int = 3   # refused: position not flagged critical
     nominations_of_leavers: int = 2         # refused: person no longer employed
+    # -- D175: the customer's leadership score ---------------------------------
+    #
+    # Needs `succession`. One overall score per nominee on a 0-100 scale under the
+    # synthetic framework SYN-LEADERSHIP-1, as the emulated customer's own system would
+    # send it (D150 — never competency-level). Mixed so every rule shows: some people
+    # also carry an older score, some only a score too old to count, a few were scored
+    # under a previous framework version, and a few people on no pipeline are scored
+    # too, which the product must refuse.
+    leadership_scores: bool = False
+    scores_for_people_on_no_pipeline: int = 3
 
 
 @dataclass
@@ -130,6 +140,8 @@ class Corpus:
     role_requirements: list[dict] = field(default_factory=list)
     # D174. Empty unless `Parameters.succession` is on.
     succession_nominations: list[dict] = field(default_factory=list)
+    # D175. Empty unless `Parameters.leadership_scores` is on.
+    leadership_scores: list[dict] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
         return {
@@ -148,6 +160,7 @@ class Corpus:
             "RoleInteraction": len(self.role_interactions),
             "RoleRequirement": len(self.role_requirements),
             "SuccessionNomination": len(self.succession_nominations),
+            "LeadershipScore": len(self.leadership_scores),
         }
 
 
@@ -284,6 +297,8 @@ def generate(params: Parameters | None = None) -> Corpus:
         # Its own generator, seeded from the parameters, so turning it on cannot shift
         # a single draw anything above made.
         _generate_succession(corpus, p, random.Random(p.seed + 174), prov)
+        if p.leadership_scores:
+            _generate_leadership_scores(corpus, p, random.Random(p.seed + 175), prov)
     return corpus
 
 
@@ -859,3 +874,41 @@ def _generate_skills(corpus: Corpus, p: Parameters, rng: random.Random, prov) ->
                 "prov": prov("skill_assertions"),
             }))
             assertion += 1
+
+
+
+FRAMEWORK_VERSION = "SYN-LEADERSHIP-1"
+PREVIOUS_FRAMEWORK_VERSION = "SYN-LEADERSHIP-0"
+
+
+def _generate_leadership_scores(corpus: Corpus, p: Parameters, rng: random.Random,
+                                prov) -> None:
+    flagged = {s["position_id"] for s in corpus.positions if s["hr_critical_flag"]}
+    employed = {x["person_id"] for x in corpus.people if x["exit_date"] is None}
+    nominees = sorted({n["person_id"] for n in corpus.succession_nominations
+                       if n["position_id"] in flagged and n["person_id"] in employed})
+    others = sorted(employed - set(nominees))
+    rows: list[tuple[str, date, str]] = []
+    for who in nominees:
+        draw = rng.random()
+        if draw < 0.08:                        # only a score too old to count
+            rows.append((who, p.history_end - timedelta(days=rng.randrange(760, 900)),
+                         FRAMEWORK_VERSION))
+            continue
+        version = PREVIOUS_FRAMEWORK_VERSION if draw < 0.13 else FRAMEWORK_VERSION
+        rows.append((who, p.history_end - timedelta(days=rng.randrange(20, 330)),
+                     version))
+        if rng.random() < 0.20:                # an older score kept beside it
+            rows.append((who, p.history_end - timedelta(days=rng.randrange(400, 700)),
+                         FRAMEWORK_VERSION))
+    for who in rng.sample(others, min(p.scores_for_people_on_no_pipeline, len(others))):
+        rows.append((who, p.history_end - timedelta(days=rng.randrange(20, 330)),
+                     FRAMEWORK_VERSION))
+    for n, (who, assessed, version) in enumerate(rows):
+        corpus.leadership_scores.append(mark({
+            "score_id": f"lsc-{n:06d}", "person_id": who,
+            "overall_score": round(rng.uniform(35, 95), 1),
+            "assessed_on": assessed.isoformat(), "framework_version": version,
+            "valid_from": assessed.isoformat(), "valid_to": None,
+            "prov": prov("leadership_scores"),
+        }))

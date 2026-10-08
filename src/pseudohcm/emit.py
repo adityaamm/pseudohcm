@@ -34,6 +34,8 @@ ENTITY_FILES = {
     "RoleInteraction": "role_interactions", "RoleRequirement": "role_requirements",
     # D174. Empty unless the corpus was generated with `succession` on.
     "SuccessionNomination": "succession_nominations",
+    # D175. Empty unless generated with `leadership_scores` on.
+    "LeadershipScore": "leadership_scores",
 }
 
 

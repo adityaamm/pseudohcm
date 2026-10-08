@@ -49,3 +49,29 @@ def test_plain_generic_bands_only():
 def test_deterministic():
     assert json.dumps(generate(ON).succession_nominations) == \
         json.dumps(generate(ON).succession_nominations)
+
+
+
+SCORED = Parameters(employee_count=4000, units=8, seed=11, succession=True,
+                    leadership_scores=True)
+
+
+def test_scores_show_every_rule():
+    from pseudohcm.generator import FRAMEWORK_VERSION, PREVIOUS_FRAMEWORK_VERSION
+    c = generate(SCORED)
+    nominees = {n["person_id"] for n in c.succession_nominations}
+    versions = Counter(s["framework_version"] for s in c.leadership_scores)
+    assert versions[FRAMEWORK_VERSION] and versions[PREVIOUS_FRAMEWORK_VERSION]
+    per = Counter(s["person_id"] for s in c.leadership_scores)
+    assert any(v >= 2 for v in per.values()), "someone carries an older score too"
+    assert any(s["person_id"] not in nominees for s in c.leadership_scores)
+    assert min(s["assessed_on"] for s in c.leadership_scores) < "2024-08-07"
+    assert {"competency", "competencies"}.isdisjoint(
+        {k for s in c.leadership_scores for k in s}), "one overall score only (D150)"
+
+
+def test_scores_shift_nothing_else():
+    a = generate(ON)
+    b = generate(SCORED)
+    assert json.dumps(a.succession_nominations) == json.dumps(b.succession_nominations)
+    assert json.dumps(a.people) == json.dumps(b.people)
