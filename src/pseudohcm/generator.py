@@ -127,6 +127,17 @@ class Parameters:
     replacement_share: float = 0.60          # backfills, the rest growth
     candidate_reuse_share: float = 0.08      # a candidate applying to a second requisition
 
+    # -- D189: who manages whom ----------------------------------------------------
+    #
+    # Opt-in. On, every assignment carries the person's manager: in each unit about
+    # one person in `team_size` is a manager, and everyone else in the unit reports to
+    # one of them. With ratings on, one team in `lenient_team_share` of units is rated
+    # a point higher than its unit's draw (capped at the top of the scale), so the
+    # manager-level check has something real to find — and the rest have nothing.
+    managers: bool = False
+    team_size: int = 8
+    lenient_team_share: float = 0.3
+
 
 @dataclass
 class Corpus:
@@ -332,7 +343,41 @@ def generate(params: Parameters | None = None) -> Corpus:
             _generate_leadership_scores(corpus, p, random.Random(p.seed + 175), prov)
     if p.talent_acquisition:
         _generate_talent_acquisition(corpus, p, random.Random(p.seed + 185), prov)
+    if p.managers:
+        _generate_managers(corpus, p, random.Random(p.seed + 189))
     return corpus
+
+
+# ---------------------------------------------------------------------------
+# D189 — manager links, for the manager-level rating check
+# ---------------------------------------------------------------------------
+
+def _generate_managers(corpus: Corpus, p: Parameters, rng: random.Random) -> None:
+    unit_of = {s["position_id"]: s["org_unit_id"] for s in corpus.positions}
+    by_unit: dict[str, list[dict]] = {}
+    for a in corpus.assignments:
+        by_unit.setdefault(unit_of[a["position_id"]], []).append(a)
+    lenient: set[str] = set()
+    for unit in sorted(by_unit):
+        members = sorted(by_unit[unit], key=lambda a: a["assignment_id"])
+        count = max(1, round(len(members) / max(1, p.team_size)))
+        managers = rng.sample(members, min(count, len(members)))
+        manager_ids = [m["person_id"] for m in managers]
+        for a in members:
+            if a in managers:
+                continue
+            a["manager_person_id"] = rng.choice(manager_ids)
+        if len(manager_ids) > 1 and rng.random() < p.lenient_team_share:
+            lenient.add(rng.choice(manager_ids))
+    if not lenient or not corpus.performance_events:
+        return
+    manager_of = {a["person_id"]: a["manager_person_id"] for a in corpus.assignments}
+    top = p.rating_points
+    for event in corpus.performance_events:
+        if manager_of.get(event["person_id"]) in lenient:
+            rank = min(top, int(event["rating_rank"]) + 1)
+            event["rating_rank"] = rank
+            event["rating_value"] = str(rank)
 
 
 # ---------------------------------------------------------------------------
