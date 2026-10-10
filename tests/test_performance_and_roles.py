@@ -397,3 +397,15 @@ class TestRoleRequirementsCarryTheirTerms:
         nobody declared."""
         known = {t["term_id"] for t in skilled.customer_skill_terms}
         assert all(rt["term_id"] in known for rt in skilled.role_required_terms)
+
+
+def test_an_expired_assertion_expires_after_it_was_made_and_before_history_ends():
+    """D180. PostgreSQL refuses an assertion whose expiry precedes it
+    (skill_assertion_expiry_after_assertion); the generator produced some, and the whole
+    load failed. Every expiry now falls between the assertion and the end of history."""
+    p = Parameters(employee_count=1500, units=5, seed=41, skill_terms=40)
+    corpus = generate(p)
+    expired = [a for a in corpus.skill_assertions if a["expires_at"]]
+    assert expired, "the corpus must still carry expired assertions"
+    for a in expired:
+        assert a["asserted_at"] < a["expires_at"] <= p.history_end.isoformat(), a

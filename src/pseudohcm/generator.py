@@ -867,8 +867,14 @@ def _generate_skills(corpus: Corpus, p: Parameters, rng: random.Random, prov) ->
                 "evidence_type": _EVIDENCE[assertion % len(_EVIDENCE)],
                 "asserted_at": asserted.isoformat(),
                 # An expired certification is not present supply. `expires_at` before
-                # `history_end` is what makes that testable.
-                "expires_at": ((p.history_end - timedelta(days=rng.randrange(1, 400)))
+                # `history_end` is what makes that testable — and after `asserted_at`,
+                # which PostgreSQL requires (skill_assertion_expiry_after_assertion).
+                # D180: the earlier rule drew it up to 400 days before history_end
+                # whatever the assertion date, so an expiry could precede its own
+                # assertion and the database refused the whole load. One draw, as
+                # before, so nothing else in the corpus moves.
+                "expires_at": ((asserted + timedelta(days=rng.randrange(
+                    1, max(2, (p.history_end - asserted).days))))
                                .isoformat() if expired else None),
                 "valid_from": asserted.isoformat(), "valid_to": None,
                 "prov": prov("skill_assertions"),
