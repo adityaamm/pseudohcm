@@ -105,6 +105,28 @@ class Parameters:
     leadership_scores: bool = False
     scores_for_people_on_no_pipeline: int = 3
 
+    # -- D185: talent acquisition ----------------------------------------------
+    #
+    # Opt-in, like everything above, so every existing corpus is byte-identical. On,
+    # the same emulated HR suite's recruiting module sends requisitions, candidates,
+    # applications and dated stage events — invented throughout, in no vendor's shape.
+    #
+    # Coherent with the rest of the corpus, not drawn beside it: every VACANT position
+    # has a requisition still being worked, and every person hired in the last
+    # `ta_history_years` was hired through a filled requisition for their own position.
+    # A few requisitions are cancelled, held or still in draft, because those are the
+    # statuses a demand figure has to handle correctly and a corpus without them never
+    # proves it does. Candidates carry no score, rank or assessment of any kind — the
+    # partition holds none (Document 09 §7).
+    talent_acquisition: bool = False
+    ta_history_years: int = 2
+    applications_per_requisition: tuple[int, int] = (6, 18)
+    cancelled_share: float = 0.06            # of requisitions not tied to a hire
+    on_hold_share: float = 0.05              # of requisitions still being worked
+    draft_share: float = 0.03                # of requisitions still being worked
+    replacement_share: float = 0.60          # backfills, the rest growth
+    candidate_reuse_share: float = 0.08      # a candidate applying to a second requisition
+
 
 @dataclass
 class Corpus:
@@ -142,6 +164,11 @@ class Corpus:
     succession_nominations: list[dict] = field(default_factory=list)
     # D175. Empty unless `Parameters.leadership_scores` is on.
     leadership_scores: list[dict] = field(default_factory=list)
+    # D185. Empty unless `Parameters.talent_acquisition` is on.
+    requisitions: list[dict] = field(default_factory=list)
+    candidates: list[dict] = field(default_factory=list)
+    applications: list[dict] = field(default_factory=list)
+    pipeline_stage_events: list[dict] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
         return {
@@ -161,6 +188,10 @@ class Corpus:
             "RoleRequirement": len(self.role_requirements),
             "SuccessionNomination": len(self.succession_nominations),
             "LeadershipScore": len(self.leadership_scores),
+            "Requisition": len(self.requisitions),
+            "Candidate": len(self.candidates),
+            "Application": len(self.applications),
+            "PipelineStageEvent": len(self.pipeline_stage_events),
         }
 
 
@@ -299,7 +330,222 @@ def generate(params: Parameters | None = None) -> Corpus:
         _generate_succession(corpus, p, random.Random(p.seed + 174), prov)
         if p.leadership_scores:
             _generate_leadership_scores(corpus, p, random.Random(p.seed + 175), prov)
+    if p.talent_acquisition:
+        _generate_talent_acquisition(corpus, p, random.Random(p.seed + 185), prov)
     return corpus
+
+
+# ---------------------------------------------------------------------------
+# D185 — talent acquisition
+# ---------------------------------------------------------------------------
+
+# The funnel, in order, and the share of applications that move on from each stage.
+# Invented round numbers for a test harness — not a benchmark and not anyone's data.
+_PROGRESSION = (("APPLIED", 0.45), ("SCREENED", 0.55), ("INTERVIEWING", 0.50),
+                ("FINAL_STAGE", 0.60), ("OFFER", 0.80))
+_SOURCES = (("DIRECT", 0.40), ("SOURCED", 0.20), ("REFERRAL", 0.15),
+            ("AGENCY", 0.12), ("INTERNAL", 0.13))
+# Time to fill grows with level. Invented ranges, in days.
+_FILL_DAYS = {"L3": (20, 60), "L4": (25, 75), "L5": (35, 95), "L6": (50, 130),
+              "L7": (70, 200)}
+_RETENTION_DAYS = 730
+# Structural reasons only. Never an assessment of the candidate (migration 008).
+_WITHDRAWN = "withdrawn by candidate"
+_DECLINED = "offer declined"
+_CANCELLED = "requisition cancelled"
+
+
+def _pick(rng: random.Random, weighted: tuple[tuple[str, float], ...]) -> str:
+    draw, total = rng.random(), 0.0
+    for label, share in weighted:
+        total += share
+        if draw < total:
+            return label
+    return weighted[-1][0]
+
+
+def _generate_talent_acquisition(corpus: Corpus, p: Parameters, rng: random.Random,
+                                 prov) -> None:
+    end = p.history_end
+    window_start = max(p.history_start,
+                       end - timedelta(days=int(365.25 * p.ta_history_years)))
+    jobs = {j["job_id"]: j for j in corpus.jobs}
+    seat_of = {a["person_id"]: a["position_id"] for a in corpus.assignments}
+    seats = {s["position_id"]: s for s in corpus.positions}
+
+    # (position, status, opened_on, filled_on or None, hire date or None)
+    plan: list[tuple[dict, str, date, date | None, date | None]] = []
+
+    # Filled: one per person hired inside the window, for their own position.
+    for person in corpus.people:
+        hired = date.fromisoformat(person["hire_date_current"])
+        if hired < window_start:
+            continue
+        seat = seats[seat_of[person["person_id"]]]
+        low, high = _FILL_DAYS[jobs[seat["job_id"]]["job_level"]]
+        filled = hired - timedelta(days=rng.randrange(14, 46))
+        opened = filled - timedelta(days=rng.randrange(low, high + 1))
+        if opened < p.history_start:
+            continue
+        plan.append((seat, "FILLED", opened, filled, hired))
+
+    # Still being worked: every vacant position.
+    # By quota rather than by draw, at least one of each where there are a handful of
+    # vacancies: a small corpus that happened to draw no held requisition would never
+    # prove a demand figure treats one correctly.
+    vacant = [s for s in corpus.positions if s["status"] == "VACANT"]
+    quota = (lambda share: max(1, round(share * len(vacant))) if len(vacant) >= 4
+             else 0)
+    statuses = (["DRAFT"] * quota(p.draft_share) + ["ON_HOLD"] * quota(p.on_hold_share))
+    statuses += ["OPEN"] * (len(vacant) - len(statuses))
+    rng.shuffle(statuses)
+    for seat, status in zip(vacant, statuses):
+        opened = end - timedelta(days=rng.randrange(5, 240))
+        plan.append((seat, status, opened, None, None))
+
+    # Cancelled: drawn on filled positions, opened and closed inside the window.
+    cancelled = int(round(len(plan) * p.cancelled_share))
+    filled_seats = [s for s in corpus.positions if s["status"] == "FILLED"]
+    span = max(1, (end - window_start).days - 60)
+    for _ in range(min(cancelled, len(filled_seats))):
+        opened = window_start + timedelta(days=rng.randrange(span))
+        plan.append((rng.choice(filled_seats), "CANCELLED", opened, None, None))
+
+    plan.sort(key=lambda row: (row[2], row[0]["position_id"]))
+    pool: list[dict] = []          # candidates who may apply again
+    for n, (seat, status, opened, filled, _hired) in enumerate(plan):
+        req_id = f"req-{n:06d}"
+        base = {
+            "requisition_id": req_id, "job_id": seat["job_id"],
+            "position_id": seat["position_id"], "org_unit_id": seat["org_unit_id"],
+            "openings": 1, "opened_on": opened.isoformat(),
+            "is_replacement": rng.random() < p.replacement_share,
+            "prov": prov("requisitions"),
+        }
+        # Effective-dated, as an HR system holds it: the requisition was OPEN until the
+        # day it was filled or cancelled, and a reader asking about a date in between
+        # must see it open. One version only would make every past demand figure read
+        # today's status.
+        closed_on = filled if status == "FILLED" else (
+            opened + timedelta(days=rng.randrange(20, 60)) if status == "CANCELLED" else None)
+        if closed_on is not None and closed_on > end:
+            closed_on = None
+            status = "OPEN"
+        if closed_on is None:
+            corpus.requisitions.append(mark({
+                **base, "status": status, "filled_on": None,
+                "valid_from": opened.isoformat(), "valid_to": None}))
+        else:
+            corpus.requisitions.append(mark({
+                **base, "status": "OPEN", "filled_on": None,
+                "valid_from": opened.isoformat(), "valid_to": closed_on.isoformat()}))
+            corpus.requisitions.append(mark({
+                **base, "status": status,
+                "filled_on": filled.isoformat() if status == "FILLED" else None,
+                "valid_from": closed_on.isoformat(), "valid_to": None}))
+        if status == "DRAFT":
+            continue               # not yet advertised: nobody has applied
+
+        low, high = p.applications_per_requisition
+        count = rng.randint(low, high)
+        hire_slot = rng.randrange(count) if status == "FILLED" else -1
+        last_day = closed_on or end
+        applied_by = max(opened, last_day - timedelta(days=1))
+        used: set[str] = set()
+        for k in range(count):
+            applied = opened + timedelta(
+                days=rng.randrange(0, max(1, (applied_by - opened).days)))
+            if pool and rng.random() < p.candidate_reuse_share:
+                candidate = rng.choice(pool)
+                # Only someone already known on the day, and not twice on one
+                # requisition (application_one_per_requisition).
+                if (candidate["candidate_id"] in used
+                        or candidate["first_seen_on"] > applied.isoformat()):
+                    candidate = None
+            else:
+                candidate = None
+            if candidate is None:
+                c = len(corpus.candidates)
+                candidate = mark({
+                    "candidate_id": f"cand-{c:06d}", "display_ref": f"CAND-{c:06d}",
+                    "source": _pick(rng, _SOURCES),
+                    "first_seen_on": applied.isoformat(),
+                    "retain_until": (applied + timedelta(days=_RETENTION_DAYS)).isoformat(),
+                    "valid_from": applied.isoformat(), "valid_to": None,
+                    "prov": prov("candidates"),
+                })
+                corpus.candidates.append(candidate)
+                pool.append(candidate)
+            used.add(candidate["candidate_id"])
+            app_id = f"app-{len(corpus.applications):07d}"
+            corpus.applications.append(mark({
+                "application_id": app_id, "candidate_id": candidate["candidate_id"],
+                "requisition_id": req_id, "applied_on": applied.isoformat(),
+                "valid_from": applied.isoformat(), "valid_to": None,
+                "prov": prov("applications"),
+            }))
+            _stage_events(corpus, rng, app_id, applied, last_day, status,
+                          hired=(k == hire_slot), filled=filled, prov=prov)
+
+
+def _stage_events(corpus: Corpus, rng: random.Random, app_id: str, applied: date,
+                  last_day: date, status: str, *, hired: bool, filled: date | None,
+                  prov) -> None:
+    """One application's dated path through the funnel.
+
+    The hire reaches ACCEPTED on the requisition's filled date. Everyone else on a
+    closed requisition has exited by its closing day; on an open one, an application
+    may still be in progress at any stage.
+    """
+    events: list[tuple[str, date, str | None]] = [("APPLIED", applied, None)]
+    day = applied
+    stage_index = 0
+    ending: tuple[str, str | None] | None = None
+    while True:
+        stage, moves_on = _PROGRESSION[stage_index]
+        step = timedelta(days=rng.randrange(3, 15))
+        if hired:
+            if stage_index == len(_PROGRESSION) - 1:
+                break
+            nxt = _PROGRESSION[stage_index + 1][0]
+            day = min(day + step, (filled or last_day) - timedelta(days=1))
+            day = max(day, events[-1][1])
+            events.append((nxt, day, None))
+            stage_index += 1
+            continue
+        if day + step > last_day:
+            if status in ("FILLED", "CANCELLED"):
+                # A cancelled requisition ends its applications as "did not proceed",
+                # with the structural reason — the candidate did not withdraw.
+                ending = ("REJECTED", _CANCELLED if status == "CANCELLED" else None)
+            break                  # open requisition: still in progress here
+        day = day + step
+        if rng.random() < moves_on and stage_index < len(_PROGRESSION) - 1:
+            stage_index += 1
+            events.append((_PROGRESSION[stage_index][0], day, None))
+            continue
+        if stage == "OFFER":
+            ending = ("DECLINED", _DECLINED) if rng.random() < 0.7 else ("WITHDRAWN", _WITHDRAWN)
+        else:
+            ending = ("REJECTED", None) if rng.random() < 0.8 else ("WITHDRAWN", _WITHDRAWN)
+        break
+    if hired:
+        events.append(("ACCEPTED", filled, None))
+    elif ending is not None:
+        when = min(day, last_day)
+        when = max(when, events[-1][1])
+        events.append((ending[0], when, ending[1]))
+    seen: set[tuple[str, date]] = set()
+    for stage, when, reason in events:
+        if (stage, when) in seen:
+            continue
+        seen.add((stage, when))
+        corpus.pipeline_stage_events.append(mark({
+            "event_id": f"pse-{len(corpus.pipeline_stage_events):08d}",
+            "application_id": app_id, "stage": stage,
+            "entered_on": when.isoformat(), "exit_reason": reason,
+            "prov": prov("pipeline_events"),
+        }))
 
 
 # ---------------------------------------------------------------------------

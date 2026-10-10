@@ -36,6 +36,10 @@ ENTITY_FILES = {
     "SuccessionNomination": "succession_nominations",
     # D175. Empty unless generated with `leadership_scores` on.
     "LeadershipScore": "leadership_scores",
+    # D185. The recruiting module. Empty unless generated with `talent_acquisition` on;
+    # read only by a talent_acquisition profile, never by the core HR one.
+    "Requisition": "requisitions", "Candidate": "candidates",
+    "Application": "applications", "PipelineStageEvent": "pipeline_stage_events",
 }
 
 
